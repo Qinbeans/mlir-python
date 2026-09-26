@@ -64,11 +64,13 @@ CIBW_CONTAINER_ENGINE=podman uvx cibuildwheel --platform linux   # or docker
 
 ### Releasing and installing elsewhere
 
-Set `version` in `pyproject.toml`, then push a matching tag (`v0.2.0` for
-`0.2.0`; a mismatch fails the build). The wheels are attached to a GitHub
-release, and `.github/workflows/index.yml` republishes a flat package index of
-every release's wheels to GitHub Pages (one-time setup: Settings → Pages →
-Source: GitHub Actions). It also reruns when a release is edited or deleted.
+To release, bump `version` in `pyproject.toml` and push to main. When the
+version has no `v<version>` tag yet, the Wheels workflow builds and tests the
+wheels, then creates release `v<version>` (and its tag) at that commit with the
+wheels attached. Pushing a `v*` tag by hand also releases, as long as it matches
+the version. `.github/workflows/index.yml` then republishes a flat package index
+of every release's wheels to GitHub Pages. It also reruns when a release is
+edited or deleted.
 
 Other projects install from that index. With uv:
 
@@ -78,7 +80,7 @@ dependencies = ["mlir-python"]
 
 [[tool.uv.index]]
 name = "mlir-python"
-url = "https://OWNER.github.io/mlir-python/"
+url = "https://qinbeans.github.io/mlir-python/"
 format = "flat"
 explicit = true            # only mlir-python comes from here
 
@@ -86,7 +88,7 @@ explicit = true            # only mlir-python comes from here
 mlir-python = { index = "mlir-python" }
 ```
 
-With pip: `pip install mlir-python --find-links https://OWNER.github.io/mlir-python/`.
+With pip: `pip install mlir-python --find-links https://qinbeans.github.io/mlir-python/`.
 Each link carries the wheel's SHA-256, so installers verify downloads and uv
 records the hash in the consumer's lockfile.
 

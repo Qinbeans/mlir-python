@@ -1,8 +1,12 @@
 # Builds self-contained wheels: LLVM and MLIR are compiled from the
 # third_party/llvm-project submodule and linked statically into the extension,
 # so installing the wheel needs nothing else. One abi3 wheel per platform
-# serves every CPython >= 3.12. A `v*` tag matching the version in
-# pyproject.toml publishes the wheels to a release and the package index.
+# serves every CPython >= 3.12.
+#
+# Releasing is bumping `version` in pyproject.toml: when a push to main has a
+# version with no `v<version>` tag yet, the tested wheels are published as
+# release `v<version>` (creating the tag) and the package index is updated.
+# Pushing a `v*` tag by hand releases too, if it matches the version.
 name: Wheels
 
 on:
@@ -14,11 +18,44 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel a run on main or a tag: it may be publishing a release.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  version:
+    name: Check for a new version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      release: ${{ steps.check.outputs.release }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: check
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          release=false
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match version $version in pyproject.toml"
+              exit 1
+            fi
+            release=true
+          elif [ "$GITHUB_EVENT_NAME" = push ]; then
+            # Exit status 2 means no such tag; anything else nonzero is an error.
+            status=0
+            git ls-remote --exit-code --tags origin "refs/tags/v$version" > /dev/null || status=$?
+            case $status in
+              0) ;;
+              2) release=true; echo "::notice::version $version is new; releasing v$version" ;;
+              *) exit "$status" ;;
+            esac
+          fi
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
   wheel:
     name: Wheel (${{ matrix.arch }})
+    needs: version
     runs-on: ${{ matrix.runner }}
     # A cold build compiles LLVM; ccache makes later builds much faster.
     timeout-minutes: 360
@@ -34,15 +71,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: true # shallow, like the checkout itself
-
-      - name: Check the tag matches the package version
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match version $version in pyproject.toml"
-            exit 1
-          fi
 
       - name: Restore compiler cache
         uses: actions/cache@v6
@@ -70,9 +98,9 @@ jobs:
           path: wheelhouse/*.whl
 
   release:
-    name: Attach wheels to the release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: wheel
+    name: Release v${{ needs.version.outputs.version }}
+    if: needs.version.outputs.release == 'true'
+    needs: [version, wheel]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -82,8 +110,13 @@ jobs:
           pattern: wheel-*
           merge-multiple: true
           path: wheelhouse
+      # Creates the tag at this commit when it does not exist yet.
       - uses: softprops/action-gh-release@v3
         with:
+          tag_name: v${{ needs.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
           files: wheelhouse/*.whl
 
   index:

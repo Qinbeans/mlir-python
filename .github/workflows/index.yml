@@ -1,7 +1,7 @@
 # Publishes a flat package index of every release's wheels to GitHub Pages.
 # Other projects install from it with
-#   uv:  [[tool.uv.index]] url = "https://OWNER.github.io/REPO/", format = "flat"
-#   pip: pip install mlir-python --find-links https://OWNER.github.io/REPO/
+#   uv:  [[tool.uv.index]] url = "https://qinbeans.github.io/mlir-python/", format = "flat"
+#   pip: pip install mlir-python --find-links https://qinbeans.github.io/mlir-python/
 # Requires Settings -> Pages -> Source: "GitHub Actions".
 name: Package index
 
