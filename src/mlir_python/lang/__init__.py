@@ -34,6 +34,19 @@ divisor's sign, ``/`` on integers gives ``f64``), comparisons (chained too),
 ``min``, ``max``, and calls between the program's functions. Mistakes raise
 ``CompileError``, shown like a ``SyntaxError`` at the offending line.
 
+Group values with ``@struct`` classes (C structs, passed to C functions by
+value as C does)::
+
+    @struct
+    class Color:
+        r: u8
+        g: u8
+        b: u8
+        a: u8
+
+    @program.extern
+    def ClearBackground(color: Color) -> None: ...
+
 Split code across files with ``Module``: a compilation unit whose functions
 other modules import (``from mathlib import cube``) and call from compiled
 code; everything a program imports is linked in automatically. A ``Program``
@@ -45,7 +58,23 @@ The MLIR layer underneath stays available: ``module.mlir`` is an ordinary
 
 from ._compiler import CompileError
 from ._program import Function, Module, Program
-from .types import Ptr, cstr, f32, f64, i8, i16, i32, i64, ptr, stack, u8, u16, u32, u64
+from .types import (
+    Ptr,
+    cstr,
+    f32,
+    f64,
+    i8,
+    i16,
+    i32,
+    i64,
+    ptr,
+    stack,
+    struct,
+    u8,
+    u16,
+    u32,
+    u64,
+)
 
 __all__ = [
     "CompileError",
@@ -62,6 +91,7 @@ __all__ = [
     "i64",
     "ptr",
     "stack",
+    "struct",
     "u8",
     "u16",
     "u32",

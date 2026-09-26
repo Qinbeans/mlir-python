@@ -15,24 +15,37 @@ ordinary, fully type-checked Python. Calling a type converts: ``i32(x)``,
 
 from __future__ import annotations
 
+import dataclasses
+import inspect
 from dataclasses import dataclass
 from typing import Literal
 
 from .._mlir_python import F32Type, F64Type, IntegerType, Type
 from ..dialects import llvm
 
-type Kind = Literal["int", "uint", "float", "bool", "ptr", "cstr"]
+type Kind = Literal["int", "uint", "float", "bool", "ptr", "cstr", "struct"]
 
 
 @dataclass(frozen=True)
 class ScalarType:
-    """A machine scalar type. The public instances are the names exported
-    from this module; the compiler reads them from annotations."""
+    """A machine type: a scalar, or a ``StructType``. The public instances are
+    the names exported from this module; the compiler reads them from
+    annotations."""
 
     name: str
     kind: Kind
     bits: int
     element: ScalarType | None = None  # what a typed pointer (Ptr[T]) points to
+
+    @property
+    def size(self) -> int:
+        """Size in bytes, as C lays it out (``sizeof``)."""
+        return 1 if self.kind == "bool" else self.bits // 8
+
+    @property
+    def alignment(self) -> int:
+        """Alignment in bytes, as C lays it out (``_Alignof``)."""
+        return self.size
 
     def mlir(self) -> Type:
         """The MLIR type representing this type (in the current context)."""
@@ -98,8 +111,6 @@ class Ptr:
     ``ptr``. At runtime ``Ptr[T]`` is a pointer ``ScalarType``."""
 
     def __class_getitem__(cls, element: object) -> ScalarType:
-        from ._compiler import scalar_type
-
         kind = scalar_type(element)
         if kind is None:
             raise TypeError(f"Ptr[...] needs a scalar type, got {element!r}")
@@ -122,9 +133,116 @@ def stack(kind: object, count: int = 1) -> object:
 cstr = ScalarType("cstr", "cstr", 64)
 """A pointer to a NUL-terminated C string; string literals convert to it."""
 
+BUILTIN_TYPES: dict[object, ScalarType] = {
+    int: i64,
+    float: f64,
+    bool: boolean,
+    str: cstr,
+}
+
+
+def scalar_type(annotation: object) -> ScalarType | None:
+    """The machine type an annotation names: a ``ScalarType``, one of
+    Python's ``int``/``float``/``bool``/``str``, or a ``@struct`` class."""
+    if isinstance(annotation, ScalarType):
+        return annotation
+    if isinstance(annotation, type):
+        declared = annotation.__dict__.get("__lang_struct__")
+        if isinstance(declared, StructType):
+            return declared
+    return BUILTIN_TYPES.get(annotation)
+
+
+@dataclass(frozen=True)
+class StructType(ScalarType):
+    """A C struct declared with ``@struct``: its fields in order, laid out
+    as C lays them out (each field at its natural alignment)."""
+
+    fields: tuple[tuple[str, ScalarType], ...] = ()
+    python: type | None = dataclasses.field(default=None, compare=False)
+
+    @property
+    def size(self) -> int:
+        end = 0
+        for _, kind in self.fields:
+            end = _align(end, kind.alignment) + kind.size
+        return _align(end, self.alignment)
+
+    @property
+    def alignment(self) -> int:
+        return max((kind.alignment for _, kind in self.fields), default=1)
+
+    def offsets(self) -> list[int]:
+        """Each field's byte offset."""
+        offsets, end = [], 0
+        for _, kind in self.fields:
+            start = _align(end, kind.alignment)
+            offsets.append(start)
+            end = start + kind.size
+        return offsets
+
+    def field(self, name: str) -> tuple[int, ScalarType] | None:
+        """The index and type of field ``name``."""
+        for index, (field_name, kind) in enumerate(self.fields):
+            if field_name == name:
+                return index, kind
+        return None
+
+    def mlir(self) -> Type:
+        # LLVM lays out a non-packed struct as C does for these field types.
+        return llvm.StructType([kind.mlir() for _, kind in self.fields])
+
+    def __call__(self, value: object) -> object:
+        raise TypeError(f"construct {self.name} with {self.name}(...)")
+
+
+def _align(offset: int, alignment: int) -> int:
+    return -(-offset // alignment) * alignment
+
+
+def struct[T](cls: type[T]) -> type[T]:
+    """Declare a C struct: a class whose annotated fields are machine types,
+    in C's order::
+
+        @struct
+        class Color:
+            r: u8
+            g: u8
+            b: u8
+            a: u8
+
+    Compiled code constructs it (``Color(245, 245, 245, 255)``, or with field
+    names), reads and assigns fields (``c.r``, ``c.r = 0``), passes it to and
+    returns it from functions (by value, following the C ABI for externs),
+    and points at it (``Ptr[Color]``, ``stack(Color)``). The class is also an
+    ordinary dataclass in Python.
+
+    Raises:
+        TypeError: If a field is not a machine type or another ``@struct``.
+    """
+    annotations = inspect.get_annotations(cls, eval_str=True)
+    if not annotations:
+        raise TypeError(f"@struct class {cls.__name__} declares no fields")
+    fields: list[tuple[str, ScalarType]] = []
+    for name, annotation in annotations.items():
+        kind = scalar_type(annotation)
+        if kind is None:
+            raise TypeError(
+                f"field '{name}' of {cls.__name__} has type {annotation!r}; "
+                "use a type such as i32, f32, ptr, or another @struct"
+            )
+        fields.append((name, kind))
+    declared = dataclasses.dataclass(cls)
+    kind = StructType(cls.__name__, "struct", 0, None, tuple(fields), declared)
+    kind = dataclasses.replace(kind, bits=kind.size * 8)
+    declared.__lang_struct__ = kind  # type: ignore[attr-defined]
+    return declared
+
+
 __all__ = [
     "Ptr",
     "ScalarType",
+    "StructType",
     "cstr",
     "f32",
     "f64",
@@ -134,6 +252,7 @@ __all__ = [
     "i64",
     "ptr",
     "stack",
+    "struct",
     "u8",
     "u16",
     "u32",

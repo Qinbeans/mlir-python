@@ -8,11 +8,11 @@
 # annotations (see types.py).
 
 from dataclasses import dataclass
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal, TypeAlias, dataclass_transform
 
 from .._mlir_python import Type
 
-type Kind = Literal["int", "uint", "float", "bool", "ptr", "cstr"]
+type Kind = Literal["int", "uint", "float", "bool", "ptr", "cstr", "struct"]
 
 @dataclass(frozen=True)
 class ScalarType:
@@ -26,6 +26,17 @@ class ScalarType:
     @property
     def signed(self) -> bool: ...
     def integer_range(self) -> tuple[int, int]: ...
+    @property
+    def size(self) -> int: ...
+    @property
+    def alignment(self) -> int: ...
+
+@dataclass(frozen=True)
+class StructType(ScalarType):
+    fields: tuple[tuple[str, ScalarType], ...] = ()
+    python: type | None = None
+    def offsets(self) -> list[int]: ...
+    def field(self, name: str) -> tuple[int, ScalarType] | None: ...
 
 i8: TypeAlias = int
 i16: TypeAlias = int
@@ -55,3 +66,21 @@ def stack[T](kind: type[T], count: int = 1) -> Ptr[T]:
     """Memory for ``count`` values of type ``kind`` on the compiled function's
     stack, e.g. ``value = stack(i32)`` to pass to C's ``scanf``. It lives until
     the function returns."""
+
+@dataclass_transform()
+def struct[T](cls: type[T]) -> type[T]:
+    """Declare a C struct: a class whose annotated fields are machine types,
+    in C's order::
+
+        @struct
+        class Color:
+            r: u8
+            g: u8
+            b: u8
+            a: u8
+
+    Compiled code constructs it (``Color(245, 245, 245, 255)``, or with field
+    names), reads and assigns fields (``c.r``, ``c.r = 0``), passes it to and
+    returns it from functions (by value, following the C ABI for externs),
+    and points at it (``Ptr[Color]``, ``stack(Color)``). The class is also an
+    ordinary dataclass in Python."""

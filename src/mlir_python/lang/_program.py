@@ -27,6 +27,8 @@ from .. import _mlir_python as ir
 from .. import codegen, passes
 from .._passes import PassManager
 from ..dialects import func, llvm
+from ._abi import ExternABI, UnsupportedABI
+from ._abi import lower as lower_abi
 from ._compiler import CompileError, FunctionCompiler, Signature, Source, signature_of
 from ._types import i32
 
@@ -113,7 +115,7 @@ class _Build:
     mlir: ir.Module
     ops: dict[str, func.FuncOp]
     signatures: dict[str, Signature]
-    variadic: dict[str, llvm.FunctionType]  # C variadic externs, e.g. printf
+    externs: dict[str, ExternABI]  # C functions, called through llvm.call
     strings: dict[str, llvm.GlobalOp]
     imports: dict[str, Module] = field(default_factory=dict)  # symbol -> module
 
@@ -139,18 +141,34 @@ class Module:
         @program.main
         def main() -> i32:
             return cube(3)          # linked in automatically
+
+    A module's externs may come from libraries, which it names once::
+
+        raylib = Module("raylib", libraries=[Path("lib/libraylib.a"), "m"])
+
+        @raylib.extern
+        def GetRandomValue(lo: i32, hi: i32) -> i32: ...
     """
 
-    def __init__(self, name: str | None = None) -> None:
+    def __init__(
+        self, name: str | None = None, *, libraries: Sequence[codegen.Library] = ()
+    ) -> None:
         """Create an empty module.
 
         Args:
             name: Used in messages; the defining Python module's name by
                 default.
+            libraries: Libraries defining this module's externs, in link
+                order: names (``"m"`` for libm) or paths to ``.so``/``.a``
+                files (see ``codegen.Library``). They are loaded for JIT
+                calls and linked into anything built from a module that
+                imports this one.
         """
         caller = sys._getframe(1).f_globals.get("__name__", "module")
         self.name = name or caller
         """The module's name (for messages)."""
+        self.libraries: tuple[codegen.Library, ...] = tuple(libraries)
+        """Libraries defining this module's externs."""
         self._id = next(_MODULE_IDS)
         self._functions: dict[str, Function[..., Any]] = {}
         self._build_state: _Build | None = None
@@ -250,16 +268,17 @@ class Module:
         output: str | os.PathLike[str],
         *,
         opt_level: codegen.OptLevel = codegen.OptLevel.O2,
-        libraries: Sequence[str] = (),
+        libraries: Sequence[codegen.Library] = (),
         linker: str | None = None,
     ) -> Path:
         """Build a native shared library exporting the functions of this
-        module and the modules it imports."""
+        module and the modules it imports, linked with their ``libraries``
+        and then ``libraries``."""
         return codegen.build_shared_library(
             self.linked(),
             output,
             opt_level=opt_level,
-            libraries=libraries,
+            libraries=[*self._all_libraries(), *libraries],
             linker=linker,
         )
 
@@ -291,12 +310,13 @@ class Module:
                 sources[name] = source
                 state.signatures[name] = signature
                 with source.location(source.tree):
-                    if signature.variadic:
-                        state.variadic[name] = _declare_variadic(
-                            function.name, signature
+                    if function.kind == "extern":
+                        _check_extern(signature, source)
+                        state.externs[name] = _declare_extern(
+                            function.name, signature, source
                         )
                     else:
-                        state.ops[name] = self._declare(function, signature, source)
+                        state.ops[name] = self._declare(function, signature)
         # Set before compiling bodies so calls within and across modules
         # (including cycles) see every signature.
         self._build_state = state
@@ -324,32 +344,13 @@ class Module:
         return state
 
     def _declare(
-        self, function: Function[..., Any], signature: Signature, source: Source
+        self, function: Function[..., Any], signature: Signature
     ) -> func.FuncOp:
         inputs = [kind.mlir() for _, kind in signature.params]
         results = [kind.mlir() for kind in signature.results]
-        if function.kind == "extern":
-            body = [
-                s
-                for s in source.tree.body
-                if not (
-                    isinstance(s, ast.Expr)
-                    and isinstance(s.value, ast.Constant)
-                    and isinstance(s.value.value, str)
-                )
-            ]
-            if not (
-                len(body) == 1
-                and isinstance(body[0], ast.Expr)
-                and isinstance(body[0].value, ast.Constant)
-                and body[0].value.value is ...
-            ):
-                raise source.error(
-                    source.tree, "an extern function's body must be '...'"
-                )
-            return func.declare(function.name, inputs, results)
         if function.kind == "main":
             if signature.params or signature.results not in ([], [i32]):
+                source = Source.of(function.python)
                 raise source.error(
                     source.tree, "main takes no parameters and returns i32 or None"
                 )
@@ -368,11 +369,32 @@ class Module:
             pending.extend(module.imports)
         return order
 
+    def _all_libraries(self) -> list[codegen.Library]:
+        """The libraries of this module and its imports, each once."""
+        libraries: dict[str, codegen.Library] = {}
+        for module in self._closure():
+            for library in module.libraries:
+                key = (
+                    library
+                    if isinstance(library, str)
+                    else str(Path(library).resolve())
+                )
+                libraries.setdefault(key, library)
+        return list(libraries.values())
+
     def _run(self, function: Function[..., Any], args: Sequence[object]) -> object:
         state = self._build()
+        signature = state.signatures[function.name]
+        structs = [k for _, k in signature.params] + signature.results
+        if any(kind.kind == "struct" for kind in structs):
+            raise TypeError(
+                f"{function.name}() passes a @struct, which cannot cross from Python "
+                "yet; call it from a compiled function"
+            )
         modules = self._closure()
         key = tuple(m._version for m in modules)
         if self._compiled is None or self._compiled[0] != key:
+            codegen.load_libraries(self._all_libraries())
             _check_externs_resolve(modules)
             self._compiled = (key, codegen.compile(self.linked()))
         linked = self.linked()
@@ -393,8 +415,8 @@ class Module:
         self, function: Function[..., Any]
     ) -> tuple[func.FuncOp | None, Signature]:
         """The callee and signature of ``function``, importing it when it
-        belongs to another module (no ``FuncOp`` for C variadic externs,
-        which are called through ``llvm.call``)."""
+        belongs to another module (no ``FuncOp`` for externs, which are
+        called through ``llvm.call``; see ``extern_abi``)."""
         state = self._build_state
         assert state is not None
         if function.module is not self and function.name not in state.imports:
@@ -410,10 +432,12 @@ class Module:
             )
         signature = function.module._build().signatures[function.name]
         with ir.InsertionPoint(state.mlir.body):
-            if signature.variadic:
-                state.variadic[function.name] = _declare_variadic(
-                    function.name, signature
-                )
+            if function.kind == "extern":
+                source = Source.of(function.python)
+                with source.location(source.tree):
+                    state.externs[function.name] = _declare_extern(
+                        function.name, signature, source
+                    )
             else:
                 state.ops[function.name] = func.declare(
                     function.name,
@@ -424,11 +448,12 @@ class Module:
         state.signatures[function.name] = signature
         state.imports[function.name] = function.module
 
-    def variadic_type(self, function: Function[..., Any]) -> llvm.FunctionType:
+    def extern_abi(self, function: Function[..., Any]) -> ExternABI:
+        """How calls to the extern ``function`` pass values (the C ABI)."""
         self.declaration(function)
         state = self._build_state
         assert state is not None
-        return state.variadic[function.name]
+        return state.externs[function.name]
 
     def signature(self, function: Function[..., Any]) -> Signature:
         return function.module._build().signatures[function.name]
@@ -502,11 +527,12 @@ class Program(Module):
         output: str | os.PathLike[str],
         *,
         opt_level: codegen.OptLevel = codegen.OptLevel.O2,
-        libraries: Sequence[str] = (),
+        libraries: Sequence[codegen.Library] = (),
         linker: str | None = None,
     ) -> Path:
         """Build a native executable running the ``@program.main`` function,
-        linked with every module it imports.
+        linked with every module it imports, their ``libraries``, and then
+        ``libraries``.
 
         Raises:
             ValueError: If the program has no ``@program.main`` function.
@@ -520,20 +546,52 @@ class Program(Module):
             self.linked(),
             output,
             opt_level=opt_level,
-            libraries=libraries,
+            libraries=[*self._all_libraries(), *libraries],
             linker=linker,
         )
 
 
-def _declare_variadic(name: str, signature: Signature) -> llvm.FunctionType:
-    """A C variadic function (``...``) is declared as an ``llvm.func``;
-    ``func.func`` cannot express variadic signatures."""
-    result = signature.results[0].mlir() if signature.results else llvm.VoidType()
-    function_type = llvm.FunctionType(
-        result, [kind.mlir() for _, kind in signature.params], variadic=True
+def _check_extern(signature: Signature, source: Source) -> None:
+    """An extern's body is ``...``, and it returns at most one value."""
+    body = [
+        s
+        for s in source.tree.body
+        if not (
+            isinstance(s, ast.Expr)
+            and isinstance(s.value, ast.Constant)
+            and isinstance(s.value.value, str)
+        )
+    ]
+    if not (
+        len(body) == 1
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and body[0].value.value is ...
+    ):
+        raise source.error(source.tree, "an extern function's body must be '...'")
+    if signature.returns_tuple:
+        raise source.error(
+            source.tree.returns or source.tree,
+            "a C function returns one value; return a @struct to return several",
+        )
+
+
+def _declare_extern(name: str, signature: Signature, source: Source) -> ExternABI:
+    """Declares a C function as an ``llvm.func`` with the C ABI's view of its
+    parameters (``func.func`` cannot express variadic functions or ABI
+    attributes)."""
+    try:
+        abi = lower_abi(
+            [kind for _, kind in signature.params],
+            signature.results[0] if signature.results else None,
+            variadic=signature.variadic,
+        )
+    except UnsupportedABI as error:
+        raise source.error(source.tree, str(error)) from None
+    llvm.LLVMFuncOp(
+        name, abi.function_type, arg_attrs=abi.arg_attrs, res_attrs=abi.res_attrs
     )
-    llvm.LLVMFuncOp(name, function_type)
-    return function_type
+    return abi
 
 
 def _symbol(op: ir.Operation) -> tuple[str, bool] | None:
@@ -584,5 +642,6 @@ def _check_externs_resolve(modules: list[Module]) -> None:
             if function.kind == "extern" and not hasattr(process, function.name):
                 raise codegen.LinkError(
                     f"extern '{function.name}' of {module.name} is not defined in this "
-                    "process; check the C name (@module.extern(name=...)) or load its library"
+                    "process or its libraries; check the C name (@module.extern(name=...)) "
+                    f"or name its library: {type(module).__name__}(..., libraries=[...])"
                 )

@@ -1637,7 +1637,8 @@ class ExecutionEngine:
         Args:
             module: A module in the LLVM dialect.
             opt_level: LLVM optimization level.
-            shared_libraries: Libraries to load for external symbols.
+            shared_libraries: Paths of shared libraries to load for external
+                symbols (``codegen.compile`` also takes names and archives).
 
         Raises:
             MLIRError: If translation or compilation fails.

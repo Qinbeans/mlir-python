@@ -57,7 +57,7 @@ jobs:
     name: Wheel (${{ matrix.arch }})
     needs: version
     runs-on: ${{ matrix.runner }}
-    # A cold build compiles LLVM; ccache makes later builds much faster.
+    # A cold build compiles LLVM (~1 hour); with a warm ccache it takes minutes.
     timeout-minutes: 360
     strategy:
       fail-fast: false
@@ -72,11 +72,13 @@ jobs:
         with:
           submodules: true # shallow, like the checkout itself
 
+      # Restored from the newest run on this branch (or main), and saved even
+      # when the build fails or is cancelled, so no run starts cold twice.
       - name: Restore compiler cache
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: .ccache
-          key: ccache-${{ matrix.arch }}-${{ hashFiles('.gitmodules') }}-${{ github.run_id }}
+          key: ccache-${{ matrix.arch }}-${{ github.run_id }}
           restore-keys: ccache-${{ matrix.arch }}-
 
       - name: Build and test wheel
@@ -89,8 +91,20 @@ jobs:
             CCACHE_DIR=/host${{ github.workspace }}/.ccache
             CCACHE_BASEDIR=/project
             CCACHE_MAXSIZE=2G
+            CCACHE_COMPRESS=1
             CMAKE_C_COMPILER_LAUNCHER=ccache
             CMAKE_CXX_COMPILER_LAUNCHER=ccache
+          # Report how much of the build the cache served.
+          CIBW_BEFORE_BUILD_LINUX: ccache --zero-stats
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
+            ccache --show-stats && auditwheel repair -w {dest_dir} {wheel}
+
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.arch }}-${{ github.run_id }}
 
       - uses: actions/upload-artifact@v7
         with:

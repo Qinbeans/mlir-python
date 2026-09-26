@@ -17,6 +17,9 @@ from ._types import (
     ScalarType as ScalarType,
 )
 from ._types import (
+    StructType as StructType,
+)
+from ._types import (
     cstr as cstr,
 )
 from ._types import (
@@ -44,6 +47,9 @@ from ._types import (
     stack as stack,
 )
 from ._types import (
+    struct as struct,
+)
+from ._types import (
     u8 as u8,
 )
 from ._types import (
@@ -59,6 +65,7 @@ from ._types import (
 __all__ = [
     "Ptr",
     "ScalarType",
+    "StructType",
     "cstr",
     "f32",
     "f64",
@@ -68,6 +75,7 @@ __all__ = [
     "i64",
     "ptr",
     "stack",
+    "struct",
     "u8",
     "u16",
     "u32",

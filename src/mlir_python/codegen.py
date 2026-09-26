@@ -9,6 +9,12 @@ native binaries with ``build_executable`` and ``build_shared_library``::
 
 All of them work on a copy, so ``module`` and handles into it stay valid.
 
+External code comes in through ``libraries``: a name the system searches for
+(``"m"`` for libm) or a ``Path`` to a specific ``.so`` or ``.a`` file::
+
+    codegen.build_executable(module, "game", libraries=[Path("libraylib.a"), "m"])
+    codegen.compile(module, libraries=[Path("libkernels.so")])
+
 Each stage is also available on its own: ``llvm_lowering_pipeline`` /
 ``lower_to_llvm``, ``to_llvm_ir`` / ``translate_to_llvm_ir`` (returning an
 ``LLVMModule`` to verify, optimize, or emit as an object file or assembly),
@@ -17,6 +23,8 @@ and ``ExecutionEngine``.
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import os
 import shutil
 import subprocess
@@ -43,6 +51,7 @@ __all__ = [
     "CompiledModule",
     "ExecutionEngine",
     "LLVMModule",
+    "Library",
     "LinkError",
     "OptLevel",
     "Result",
@@ -51,6 +60,7 @@ __all__ = [
     "build_shared_library",
     "compile",
     "llvm_lowering_pipeline",
+    "load_libraries",
     "lower_to_llvm",
     "to_llvm_ir",
     "translate_to_llvm_ir",
@@ -68,6 +78,128 @@ the buffer in place."""
 
 type Result = Scalar | tuple[Scalar, ...] | None
 """What a compiled function returns: nothing, one value, or a tuple."""
+
+type Library = str | os.PathLike[str]
+"""A library providing external functions, in one of two forms:
+
+- a name (``str``) the system searches for: ``"m"`` is libm (``-lm``), and
+  ``"raylib"`` finds ``libraylib.so`` or ``libraylib.a`` on the linker's path;
+- a path (``pathlib.Path``) to a specific file: a shared library
+  (``libfoo.so``) or a static archive (``libfoo.a``).
+
+A path written as a ``str`` is rejected, since it would be searched for as a
+name; wrap it in ``Path``.
+"""
+
+
+def _library(library: Library) -> str | Path:
+    """A library's name, or its resolved path.
+
+    Raises:
+        ValueError: If a ``str`` looks like a path or a linker flag.
+        FileNotFoundError: If a path does not exist.
+    """
+    if isinstance(library, str):
+        if "/" in library or library.endswith((".a", ".so")) or ".so." in library:
+            raise ValueError(
+                f"library {library!r} looks like a file: pass Path({library!r}) "
+                "for a file, or a bare name like 'm' to search for libm"
+            )
+        if not library or library.startswith(("-", ":")):
+            raise ValueError(
+                f"library {library!r} is not a name: pass 'm' for -lm, "
+                "or a Path to a file"
+            )
+        return library
+    path = Path(library).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"library {path} does not exist")
+    return path
+
+
+def _is_archive(path: Path) -> bool:
+    with path.open("rb") as file:
+        return file.read(8) == b"!<arch>\n"
+
+
+# Libraries already loaded into this process, so each is loaded once:
+# names by name, files by (path, modification time).
+_LOADED: dict[str | tuple[Path, int], ctypes.CDLL] = {}
+
+
+def load_libraries(libraries: Sequence[Library], *, linker: str | None = None) -> None:
+    """Load ``libraries`` into this process so JIT-compiled code can call
+    their functions (``compile`` does this for its ``libraries``).
+
+    Names are found the way the dynamic loader finds them. A static archive is
+    first linked into a temporary shared library, which needs ``linker`` (a C
+    compiler driver; ``$CC``, ``cc``, ``clang``, or ``gcc`` by default) and
+    objects compiled as position-independent code (``-fPIC``).
+
+    Libraries are loaded last to first, so list them in link order (a library
+    before the libraries it depends on), as for ``build_executable``.
+    Symbols become visible to the whole process, and stay loaded.
+
+    Raises:
+        ValueError: If a ``str`` looks like a path rather than a name.
+        FileNotFoundError: If a path does not exist.
+        LinkError: If a library cannot be found, linked, or loaded.
+    """
+    resolved = [_library(library) for library in libraries]
+    for library in reversed(resolved):
+        if isinstance(library, str):
+            if library in _LOADED:
+                continue
+            found = ctypes.util.find_library(library)
+            if found is None:
+                raise LinkError(f"library '{library}' (lib{library}.so) not found")
+            _LOADED[library] = _dlopen(found, library)
+            continue
+        key = (library, library.stat().st_mtime_ns)
+        if key in _LOADED:
+            continue
+        if _is_archive(library):
+            _LOADED[key] = _load_archive(library, linker)
+        else:
+            _LOADED[key] = _dlopen(str(library), str(library))
+
+
+def _dlopen(target: str, shown: str) -> ctypes.CDLL:
+    try:
+        return ctypes.CDLL(target, mode=ctypes.RTLD_GLOBAL)
+    except OSError as error:
+        raise LinkError(f"could not load library {shown}: {error}") from None
+
+
+def _load_archive(archive: Path, linker: str | None) -> ctypes.CDLL:
+    """Links every object of ``archive`` into a temporary shared library and
+    loads it (the file can go once loaded)."""
+    driver = _find_linker(linker)
+    with tempfile.TemporaryDirectory() as scratch:
+        shared = Path(scratch) / f"{archive.stem}.so"
+        command = [
+            driver,
+            "-shared",
+            "-Wl,--whole-archive",
+            str(archive),
+            "-Wl,--no-whole-archive",
+            "-o",
+            str(shared),
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            hint = (
+                "\nThe archive's objects must be position-independent to load into "
+                "the JIT: rebuild it with -fPIC (CMake: "
+                "-DCMAKE_POSITION_INDEPENDENT_CODE=ON), or build a shared library."
+                if "-fPIC" in result.stderr or "relocation" in result.stderr
+                else ""
+            )
+            raise LinkError(
+                f"could not load static library {archive}: "
+                f"{' '.join(command)}\n{result.stderr or result.stdout}{hint}"
+            )
+        return _dlopen(str(shared), str(archive))
 
 
 def llvm_lowering_pipeline() -> list[PipelineElement]:
@@ -176,7 +308,8 @@ def compile(
     module: Module,
     *,
     opt_level: OptLevel = OptLevel.O2,
-    shared_libraries: Sequence[str] = (),
+    libraries: Sequence[Library] = (),
+    linker: str | None = None,
 ) -> CompiledModule:
     """Lower, translate, and JIT-compile a copy of ``module``.
 
@@ -187,11 +320,16 @@ def compile(
         module: IR in dialects with LLVM lowerings (func, arith, scf, cf,
             memref, math, ...).
         opt_level: LLVM optimization level.
-        shared_libraries: Libraries providing external functions.
+        libraries: Libraries providing external functions, loaded with
+            ``load_libraries``. Functions already in this process (the C
+            library, for one) need none.
+        linker: C compiler driver used to load static archives.
 
     Raises:
+        ValueError, FileNotFoundError, LinkError: See ``load_libraries``.
         MLIRError: If lowering, LLVM IR verification, or compilation fails.
     """
+    load_libraries(libraries, linker=linker)
     signatures = {
         op.sym_name: op.function_type
         for op in module.body.operations
@@ -202,9 +340,7 @@ def compile(
     lower_to_llvm(lowered)
     llvm_ir = translate_to_llvm_ir(lowered)
     llvm_ir.verify()
-    engine = ExecutionEngine(
-        lowered, opt_level=opt_level, shared_libraries=list(shared_libraries)
-    )
+    engine = ExecutionEngine(lowered, opt_level=opt_level)
     return CompiledModule(lowered, llvm_ir, engine, signatures)
 
 
@@ -246,9 +382,10 @@ def _link(
     *,
     shared: bool,
     opt_level: OptLevel,
-    libraries: Sequence[str],
+    libraries: Sequence[Library],
     linker: str | None,
 ) -> Path:
+    resolved = [_library(library) for library in libraries]
     llvm_ir = to_llvm_ir(module, opt_level=opt_level)
     driver = _find_linker(linker)
     target = Path(output).resolve()
@@ -262,7 +399,11 @@ def _link(
             "-o",
             str(target),
         ]
-        command += [f"-l{library}" for library in libraries]
+        # After the object, in the given order, as static archives require.
+        command += [
+            f"-l{library}" if isinstance(library, str) else str(library)
+            for library in resolved
+        ]
         result = subprocess.run(command, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise LinkError(
@@ -301,7 +442,7 @@ def build_executable(
     output: str | os.PathLike[str],
     *,
     opt_level: OptLevel = OptLevel.O2,
-    libraries: Sequence[str] = (),
+    libraries: Sequence[Library] = (),
     linker: str | None = None,
 ) -> Path:
     """Compile ``module`` into a native executable for this machine.
@@ -314,7 +455,8 @@ def build_executable(
         module: IR in dialects with LLVM lowerings.
         output: Path of the executable to write.
         opt_level: LLVM optimization level.
-        libraries: Extra libraries to link, by name (``"m"`` for ``-lm``).
+        libraries: Libraries to link, in link order: names (``"m"`` for
+            ``-lm``) or paths to ``.so``/``.a`` files; see ``Library``.
         linker: C compiler driver used to link; ``$CC``, ``cc``, ``clang``,
             or ``gcc`` by default.
 
@@ -322,7 +464,9 @@ def build_executable(
         The absolute path of the executable.
 
     Raises:
-        ValueError: If ``main`` is missing or has another type.
+        ValueError: If ``main`` is missing or has another type, or a library
+            ``str`` looks like a path.
+        FileNotFoundError: If a library path does not exist.
         MLIRError: If lowering, translation, or verification fails.
         LinkError: If no linker is found or linking fails.
     """
@@ -342,7 +486,7 @@ def build_shared_library(
     output: str | os.PathLike[str],
     *,
     opt_level: OptLevel = OptLevel.O2,
-    libraries: Sequence[str] = (),
+    libraries: Sequence[Library] = (),
     linker: str | None = None,
 ) -> Path:
     """Compile ``module`` into a native shared library for this machine.
@@ -354,7 +498,8 @@ def build_shared_library(
         module: IR in dialects with LLVM lowerings.
         output: Path of the library to write, e.g. ``"libkernels.so"``.
         opt_level: LLVM optimization level.
-        libraries: Extra libraries to link, by name (``"m"`` for ``-lm``).
+        libraries: Libraries to link, in link order: names (``"m"`` for
+            ``-lm``) or paths to ``.so``/``.a`` files; see ``Library``.
         linker: C compiler driver used to link; ``$CC``, ``cc``, ``clang``,
             or ``gcc`` by default.
 
@@ -362,6 +507,8 @@ def build_shared_library(
         The absolute path of the library.
 
     Raises:
+        ValueError: If a library ``str`` looks like a path.
+        FileNotFoundError: If a library path does not exist.
         MLIRError: If lowering, translation, or verification fails.
         LinkError: If no linker is found or linking fails.
     """

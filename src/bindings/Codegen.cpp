@@ -551,7 +551,8 @@ void bindCodegen(nb::module_ &m) {
            "Args:\n"
            "    module: A module in the LLVM dialect.\n"
            "    opt_level: LLVM optimization level.\n"
-           "    shared_libraries: Libraries to load for external symbols.\n\n"
+           "    shared_libraries: Paths of shared libraries to load for external\n"
+           "        symbols (``codegen.compile`` also takes names and archives).\n\n"
            "Raises:\n    MLIRError: If translation or compilation fails.")
       .def("call", &call, "name"_a, "signature"_a, "args"_a,
            nb::sig("def call(self, name: str, signature: FunctionType, "

@@ -34,6 +34,7 @@ from ..dialects import arith, cf, func, llvm, math
 from ._types import (
     Ptr,
     ScalarType,
+    StructType,
     boolean,
     cstr,
     f64,
@@ -41,6 +42,7 @@ from ._types import (
     i64,
     pointer_to,
     ptr,
+    scalar_type,
     stack,
 )
 
@@ -110,14 +112,6 @@ class Source:
         return ir.Location.file(self.filename, line, column)
 
 
-BUILTIN_TYPES: dict[object, ScalarType] = {
-    int: i64,
-    float: f64,
-    bool: boolean,
-    str: cstr,
-}
-
-
 @dataclass
 class Signature:
     params: list[tuple[str, ScalarType]]
@@ -129,12 +123,6 @@ class Signature:
         return ir.FunctionType(
             [t.mlir() for _, t in self.params], [t.mlir() for t in self.results]
         )
-
-
-def scalar_type(annotation: object) -> ScalarType | None:
-    if isinstance(annotation, ScalarType):
-        return annotation
-    return BUILTIN_TYPES.get(annotation)
 
 
 def signature_of(
@@ -457,6 +445,20 @@ def static_object(node: ast.expr, resolve: Callable[[str], object]) -> object:
     return None
 
 
+def is_runtime_value(node: ast.expr, is_local: Callable[[str], bool]) -> bool:
+    """Whether ``node``'s attributes are struct fields (``c.x``, ``p[0].x``,
+    ``make().x``) rather than names in a Python namespace (``math.pi``)."""
+    match node:
+        case ast.Name(id=name):
+            return is_local(name)
+        case ast.Attribute(value=base):
+            return is_runtime_value(base, is_local)
+        case ast.Subscript() | ast.Call():
+            return True
+        case _:
+            return False
+
+
 def type_from_expression(
     node: ast.expr, resolve: Callable[[str], object]
 ) -> ScalarType | None:
@@ -702,6 +704,10 @@ class TypeInference:
                 return self.fresh(cstr)
             case ast.Name(id=name) if ("var", name) in self.parent:
                 return self.variable(name)
+            case ast.Attribute(value=base, attr=attr) if is_runtime_value(
+                base, lambda name: ("var", name) in self.parent
+            ):
+                return self.fresh(self.field_of(self.single(base), attr))
             case ast.Name() | ast.Attribute():
                 value = static_object(node, self.resolve)
                 if isinstance(value, bool):
@@ -742,8 +748,12 @@ class TypeInference:
                 a, b = self.single(body), self.single(orelse)
                 self.union(a, b)
                 return a
-            case ast.Call(func=ast.Name() | ast.Attribute() as callee, args=args):
-                return self.call(static_object(callee, self.resolve), args)
+            case ast.Call(
+                func=ast.Name() | ast.Attribute() as callee,
+                args=args,
+                keywords=keywords,
+            ):
+                return self.call(static_object(callee, self.resolve), args, keywords)
             case ast.Call(func=ast.Subscript() as kind_node):  # Ptr[T](raw)
                 return self.fresh(type_from_expression(kind_node, self.resolve))
             case ast.Subscript(value=base, slice=index):
@@ -756,13 +766,23 @@ class TypeInference:
         key = self.expression(node)
         return self.fresh(None) if isinstance(key, list) else key
 
-    def call(self, target: object, args: list[ast.expr]) -> object | list[object]:
+    def call(
+        self, target: object, args: list[ast.expr], keywords: list[ast.keyword]
+    ) -> object | list[object]:
         from ._program import Function
 
         if target is stack and args:
             element = type_from_expression(args[0], self.resolve)
             return self.fresh(pointer_to(element) if element is not None else None)
         keys = [self.single(arg) for arg in args]
+        kind = scalar_type(target)
+        if isinstance(kind, StructType):
+            named = {k.arg: self.single(k.value) for k in keywords if k.arg}
+            for index, (name, field_kind) in enumerate(kind.fields):
+                key = keys[index] if index < len(keys) else named.get(name)
+                if key is not None:
+                    self.union(key, self.fresh(field_kind))
+            return self.fresh(kind)
         if isinstance(target, Function):
             signature = target.module.signature(target)
             for key, (_, kind) in zip(keys, signature.params, strict=False):
@@ -786,7 +806,16 @@ class TypeInference:
         fact = self.fact[self.find(pointer)]
         return fact.element if isinstance(fact, ScalarType) else None
 
+    def field_of(self, value: object, name: str) -> ScalarType | None:
+        fact = self.fact[self.find(value)]
+        if isinstance(fact, StructType) and (found := fact.field(name)):
+            return found[1]
+        return None
+
     def assign(self, target: ast.expr, value: object | list[object]) -> None:
+        if isinstance(target, ast.Attribute) and not isinstance(value, list):
+            self.union(value, self.single(target))
+            return
         if isinstance(target, ast.Subscript) and not isinstance(value, list):
             element = self.element_of(self.single(target.value))
             if element is not None:
@@ -809,6 +838,10 @@ class TypeInference:
                 key = self.single(value)
                 if not isinstance(op, ast.Div):
                     self.union(self.variable(name), key)
+            case ast.AugAssign(target=ast.Attribute() as target, op=op, value=value):
+                key = self.single(value)
+                if not isinstance(op, ast.Div):
+                    self.union(self.single(target), key)
             case ast.AnnAssign(
                 target=ast.Name(id=name), annotation=annotation, value=value
             ):
@@ -994,10 +1027,14 @@ class FunctionCompiler:
                 current = Typed(llvm.LoadOp(element.mlir(), address).result, element)
                 updated = self.binary(op, current, self.operand(value), node)
                 llvm.StoreOp(self.materialize(updated, element, node).value, address)
+            case ast.AugAssign(target=ast.Attribute() as target, op=op, value=value):
+                current = self.operand(target)
+                updated = self.binary(op, current, self.operand(value), node)
+                self.assign_field(target, updated, node)
             case ast.AugAssign(target=target, op=op, value=value):
                 if not isinstance(target, ast.Name):
                     raise self.source.error(
-                        target, "only names and p[i] can be updated"
+                        target, "only names, fields, and p[i] can be updated"
                     )
                 current = self.load(target)
                 self.assign(
@@ -1040,6 +1077,11 @@ class FunctionCompiler:
             for element, item in zip(target.elts, result.items, strict=True):
                 self.assign(element, item, node)
             return
+        if isinstance(target, ast.Attribute):
+            if result is None or isinstance(result, TupleValue):
+                raise self.source.error(node, "only a single value can be stored")
+            self.assign_field(target, result, node)
+            return
         if not isinstance(target, ast.Name):
             raise self.source.error(target, "only plain names can be assigned")
         if result is None:
@@ -1057,6 +1099,71 @@ class FunctionCompiler:
             )
         self.variable_types[target.id] = typed.type
         self.env[target.id] = typed
+
+    def field_path(
+        self, target: ast.Attribute
+    ) -> tuple[ast.expr, ScalarType, list[int], ScalarType]:
+        """For ``root.a.b``: the root expression, its struct type, the field
+        indices of ``a.b``, and the type of ``b``."""
+        names: list[ast.Attribute] = []
+        root: ast.expr = target
+        while isinstance(root, ast.Attribute):
+            names.append(root)
+            root = root.value
+        if isinstance(root, ast.Subscript):
+            _, kind = self.element_address(root)
+        else:
+            base = self.operand(root)
+            if not isinstance(base, Typed):
+                raise self.source.error(root, "only struct values have fields")
+            kind = base.type
+        root_kind = kind
+        indices: list[int] = []
+        for attribute in reversed(names):
+            index, kind = self.field(kind, attribute)
+            indices.append(index)
+        return root, root_kind, indices, kind
+
+    def field(self, kind: ScalarType, node: ast.Attribute) -> tuple[int, ScalarType]:
+        if not isinstance(kind, StructType):
+            raise self.source.error(
+                node, f"{kind.name} has no fields (only @struct values do)"
+            )
+        found = kind.field(node.attr)
+        if found is None:
+            names = ", ".join(name for name, _ in kind.fields)
+            raise self.source.error(
+                node, f"{kind.name} has no field '{node.attr}' (it has {names})"
+            )
+        return found
+
+    def assign_field(
+        self, target: ast.Attribute, value: Operand, node: ast.AST
+    ) -> None:
+        """``c.x = v`` gives the variable ``c`` a new struct value (structs are
+        values, as in C); ``p[i].x = v`` stores into memory."""
+        root, root_kind, indices, kind = self.field_path(target)
+        stored = self.materialize(value, kind, node).value
+        if isinstance(root, ast.Subscript):
+            address, _ = self.element_address(root)
+            field_address = llvm.GEPOp(
+                llvm.PointerType(),
+                address,
+                ir.DenseI32ArrayAttr([0, *indices]),
+                root_kind.mlir(),
+                [],
+            ).result
+            llvm.StoreOp(stored, field_address)
+            return
+        if not isinstance(root, ast.Name):
+            raise self.source.error(
+                target, "assign fields of a variable (c.x = ...) or of p[i]"
+            )
+        current = self.load(root)
+        updated = llvm.InsertValueOp(
+            current.value, stored, ir.DenseI64ArrayAttr(indices)
+        ).result
+        self.env[root.id] = Typed(updated, current.type)
 
     def emit_return(self, ret: Return) -> None:
         expected = self.signature.results
@@ -1112,6 +1219,9 @@ class FunctionCompiler:
             )
         raise self.source.error(node, f"name '{node.id}' is not defined")
 
+    def is_local(self, name: str) -> bool:
+        return name in self.env or name in self.all_assigned
+
     def resolve_quietly(self, name: str) -> object:
         try:
             return self.program.resolve_global(
@@ -1143,6 +1253,10 @@ class FunctionCompiler:
                 return operand
             if operand.type.kind in ("ptr", "cstr") and kind == ptr:
                 return Typed(operand.value, kind)  # any pointer passes as a ptr
+            if kind.kind == "struct" or operand.type.kind == "struct":
+                raise self.source.error(
+                    node, f"expected {kind.name}, got {operand.type.name}"
+                )
             raise self.source.error(
                 node,
                 f"expected {kind.name}, got {operand.type.name} (convert with {kind.name}(...))",
@@ -1203,6 +1317,17 @@ class FunctionCompiler:
                 raise self.source.error(
                     node, f"'{name}' cannot be used as a value here"
                 )
+            case ast.Attribute(value=base) if is_runtime_value(base, self.is_local):
+                value = self.operand(base)
+                if not isinstance(value, Typed):
+                    raise self.source.error(base, "only struct values have fields")
+                index, kind = self.field(value.type, node)
+                return Typed(
+                    llvm.ExtractValueOp(
+                        kind.mlir(), value.value, ir.DenseI64ArrayAttr([index])
+                    ).result,
+                    kind,
+                )
             case ast.Attribute():
                 found = static_object(node, self.resolve_quietly)
                 if isinstance(found, (bool, int, float)):
@@ -1254,6 +1379,11 @@ class FunctionCompiler:
         self, op: ast.operator, left: Operand, right: Operand, node: ast.AST
     ) -> Operand:
         symbol = SYMBOLS.get(type(op), type(op).__name__)
+        for side in (left, right):
+            if isinstance(side, Typed) and side.type.kind == "struct":
+                raise self.source.error(
+                    node, f"{side.type.name} values do not support {symbol}"
+                )
         if (
             isinstance(left, Literal)
             and isinstance(right, Literal)
@@ -1440,6 +1570,8 @@ class FunctionCompiler:
         kind = operand.type
         if kind.kind == "bool":
             return operand.value
+        if kind.kind == "struct":
+            raise self.source.error(node, f"a {kind.name} is not a condition")
         zero = self.materialize(Literal(0.0 if kind.kind == "float" else 0), kind, node)
         if kind.is_integer:
             return arith.CmpIOp(
@@ -1512,10 +1644,6 @@ class FunctionCompiler:
     # -- calls ----------------------------------------------------------------
 
     def call(self, node: ast.Call) -> Operand | TupleValue | None:
-        if node.keywords:
-            raise self.source.error(
-                node.keywords[0], "compiled calls take positional arguments only"
-            )
         if isinstance(node.func, ast.Subscript):  # Ptr[T](raw)
             kind = type_from_expression(node.func, self.resolve_quietly)
             if kind is None or len(node.args) != 1:
@@ -1537,6 +1665,13 @@ class FunctionCompiler:
             raise self.source.error(node.func, "only named functions can be called")
         from ._program import Function
 
+        kind = scalar_type(target)
+        if isinstance(kind, StructType):
+            return self.construct(kind, node)
+        if node.keywords:
+            raise self.source.error(
+                node.keywords[0], "compiled calls take positional arguments only"
+            )
         if isinstance(target, Function):
             return self.call_function(target, node)
         kind = scalar_type(target)
@@ -1561,6 +1696,42 @@ class FunctionCompiler:
             node.func, f"'{name}' cannot be called from compiled code"
         )
 
+    def construct(self, kind: StructType, node: ast.Call) -> Typed:
+        """``Color(r, g, b, a)`` or ``Color(r=..., ...)``: every field, once."""
+        fields = kind.fields
+        if len(node.args) > len(fields):
+            raise self.source.error(
+                node, f"{kind.name}() takes {len(fields)} fields, got {len(node.args)}"
+            )
+        given: dict[str, ast.expr] = {
+            name: arg for (name, _), arg in zip(fields, node.args, strict=False)
+        }
+        for keyword in node.keywords:
+            if keyword.arg is None or kind.field(keyword.arg) is None:
+                names = ", ".join(name for name, _ in fields)
+                raise self.source.error(
+                    keyword,
+                    f"{kind.name} has no field '{keyword.arg}' (it has {names})",
+                )
+            if keyword.arg in given:
+                raise self.source.error(
+                    keyword, f"field '{keyword.arg}' of {kind.name} is given twice"
+                )
+            given[keyword.arg] = keyword.value
+        missing = [name for name, _ in fields if name not in given]
+        if missing:
+            raise self.source.error(
+                node, f"{kind.name}() is missing {', '.join(repr(m) for m in missing)}"
+            )
+        value = llvm.UndefOp(kind.mlir()).result
+        for index, (name, field_kind) in enumerate(fields):
+            arg = given[name]
+            field_value = self.materialize(self.operand(arg), field_kind, arg).value
+            value = llvm.InsertValueOp(
+                value, field_value, ir.DenseI64ArrayAttr([index])
+            ).result
+        return Typed(value, kind)
+
     def call_function(
         self, target: Function[..., Any], node: ast.Call
     ) -> Operand | TupleValue | None:
@@ -1578,17 +1749,9 @@ class FunctionCompiler:
             self.materialize(self.operand(arg), kind, arg).value
             for arg, (_, kind) in zip(node.args, signature.params, strict=False)
         ]
-        if signature.variadic:
+        if target.kind == "extern":
             extra = [self.promote(self.operand(arg), arg) for arg in node.args[fixed:]]
-            call = llvm.CallOp(
-                values + extra,
-                var_callee_type=self.program.variadic_type(target),
-                callee=target.name,
-                result_type=signature.results[0].mlir() if signature.results else None,
-            )
-            return (
-                Typed(call.result, signature.results[0]) if signature.results else None
-            )
+            return self.call_extern(target, values, extra)
         assert callee is not None
         results = func.call(callee, values).results
         typed = [
@@ -1600,6 +1763,89 @@ class FunctionCompiler:
         if signature.returns_tuple:
             return TupleValue(list(typed))
         return typed[0]
+
+    def call_extern(
+        self, target: Function[..., Any], values: list[ir.Value], extra: list[ir.Value]
+    ) -> Typed | None:
+        """A call to a C function, passing structs as the C ABI requires (see
+        ``_abi``)."""
+        abi = self.program.extern_abi(target)
+        operands: list[ir.Value] = []
+        result_slot = None
+        if abi.result is not None and abi.result.passing == "byval":
+            result_slot = self.stack_slot(abi.result.kind)
+            operands.append(result_slot)
+        for lowered, value in zip(abi.params, values, strict=True):
+            if lowered.passing == "direct":
+                operands.append(value)
+                continue
+            slot = self.stack_slot(lowered.kind)
+            llvm.StoreOp(value, slot)
+            if lowered.passing == "pieces":
+                operands += [
+                    llvm.LoadOp(piece, self.byte_offset(slot, offset)).result
+                    for offset, piece in lowered.pieces
+                ]
+            else:
+                operands.append(slot)
+        result = abi.result
+        result_type: ir.Type | None = None
+        if result is not None and result.passing == "direct":
+            result_type = result.kind.mlir()
+        elif result is not None and result.passing == "pieces":
+            pieces = [piece for _, piece in result.pieces]
+            result_type = pieces[0] if len(pieces) == 1 else llvm.StructType(pieces)
+        empty = ir.DictAttr({})
+        call = llvm.CallOp(
+            operands + extra,
+            var_callee_type=abi.function_type
+            if target.module.signature(target).variadic
+            else None,
+            callee=target.name,
+            result_type=result_type,
+            arg_attrs=ir.ArrayAttr([*abi.arg_attrs, *(empty for _ in extra)]),
+            res_attrs=abi.res_attrs,
+        )
+        if result is None:
+            return None
+        kind = result.kind
+        if result.passing == "direct":
+            return Typed(call.result, kind)
+        if result.passing == "byval":
+            assert result_slot is not None
+            return Typed(llvm.LoadOp(kind.mlir(), result_slot).result, kind)
+        slot = self.stack_slot(kind)
+        if len(result.pieces) == 1:
+            llvm.StoreOp(call.result, slot)
+        else:
+            for index, (offset, piece) in enumerate(result.pieces):
+                part = llvm.ExtractValueOp(
+                    piece, call.result, ir.DenseI64ArrayAttr([index])
+                ).result
+                llvm.StoreOp(part, self.byte_offset(slot, offset))
+        return Typed(llvm.LoadOp(kind.mlir(), slot).result, kind)
+
+    def stack_slot(self, kind: ScalarType) -> ir.Value:
+        """Stack memory for a ``kind`` value, in whole 8-byte words so that
+        register-sized pieces can be loaded from it."""
+        words = llvm.ArrayType(ir.IntegerType(64), -(-kind.size // 8))
+        with ir.InsertionPoint.at_block_begin(self.entry_block):
+            one = arith.ConstantOp(ir.IntegerAttr(1, ir.IntegerType(64))).result
+            return llvm.AllocaOp(
+                llvm.PointerType(), one, words, alignment=max(8, kind.alignment)
+            ).result
+
+    @staticmethod
+    def byte_offset(address: ir.Value, offset: int) -> ir.Value:
+        if offset == 0:
+            return address
+        return llvm.GEPOp(
+            llvm.PointerType(),
+            address,
+            ir.DenseI32ArrayAttr([offset]),
+            ir.IntegerType(8),
+            [],
+        ).result
 
     def promote(self, operand: Operand, node: ast.AST) -> ir.Value:
         """C's default argument promotions for the ``...`` part of a variadic
@@ -1616,6 +1862,10 @@ class FunctionCompiler:
                 Literal(number), i32 if low <= number <= high else i64, node
             ).value
         kind = operand.type
+        if kind.kind == "struct":
+            raise self.source.error(
+                node, f"a {kind.name} cannot be passed as a variadic argument"
+            )
         if kind.kind == "bool" or (kind.is_integer and kind.bits < 32):
             return self.convert(operand, i32, node).value
         if kind.kind == "float" and kind.bits < 64:

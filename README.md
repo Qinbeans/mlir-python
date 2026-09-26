@@ -141,6 +141,41 @@ print(program)                            # the MLIR; program.llvm_ir() for LLVM
   parameter type, any `Ptr[T]` passes as an opaque `ptr`, and `Ptr[T](raw)`
   types one. `@program.extern(name="printf")` separates the Python name from
   the C symbol.
+- Structs: a `@struct` class declares a C struct (and is an ordinary
+  dataclass to Python and type checkers). Compiled code constructs it
+  (`Color(245, 245, 245, 255)`, or by field name), reads and assigns fields
+  (`c.r`, `v.x += 1.0`, `camera.target.y = 0.0`; structs are values, as in C),
+  stores it in memory (`Ptr[Color]`, `stack(Color, n)`, `p[i].r = 0`), and
+  passes it by value. Calls to externs follow the C calling convention of
+  x86-64 and AArch64, including `bool` and small-integer extension, so C
+  libraries take and return structs as C code would:
+
+  ```python
+  @struct
+  class Color:
+      r: u8
+      g: u8
+      b: u8
+      a: u8
+
+  @raylib.extern
+  def ClearBackground(color: Color) -> None: ...
+  @raylib.extern
+  def WindowShouldClose() -> bool: ...
+  ```
+
+  Structs cannot yet be passed between Python and a JIT-compiled function,
+  and functions you compile pass them in MLIR's own convention, so C code
+  calling a `build_shared_library` export cannot take structs by value.
+- Libraries: `Module(..., libraries=[...])` names the libraries defining its
+  externs, in link order: a name the system searches for (`"m"` for libm) or
+  a `Path` to a `.so` or `.a` file. They are loaded for JIT calls and linked
+  into every executable or shared library that imports the module; a static
+  archive loaded into the JIT must be compiled with `-fPIC`.
+
+  ```python
+  raylib = Module("raylib", libraries=[Path("lib/libraylib.a"), "m"])
+  ```
 - Mistakes raise `CompileError`, shown like a `SyntaxError` with the file,
   line, and a caret; reading a variable not assigned on every path is an error.
 - Split code across files with `Module`: a compilation unit whose functions
