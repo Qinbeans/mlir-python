@@ -1,0 +1,588 @@
+"""``Module``, ``Program``, and ``Function``: the user-facing objects of
+``mlir_python.lang``.
+
+A ``Module`` is a compilation unit, like a C translation unit or library. Its
+functions are ordinary Python objects: import them from another module and
+call them from compiled code, and the modules link together when something is
+run or built. A ``Program`` is a module that can also have an entry point and
+build executables.
+"""
+
+from __future__ import annotations
+
+import ast
+import atexit
+import builtins
+import ctypes
+import itertools
+import os
+import sys
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import CellType
+from typing import Any, Literal, cast, overload
+
+from .. import _mlir_python as ir
+from .. import codegen, passes
+from .._passes import PassManager
+from ..dialects import func, llvm
+from ._compiler import CompileError, FunctionCompiler, Signature, Source, signature_of
+from ._types import i32
+
+type Kind = Literal["function", "extern", "main"]
+
+# Every module shares one MLIR context, so modules can be linked by combining
+# their operations directly.
+_CONTEXTS: list[ir.Context] = []
+
+
+def _context() -> ir.Context:
+    """The context shared by every module (created on first use)."""
+    if not _CONTEXTS:
+        _CONTEXTS.append(ir.Context())
+    return _CONTEXTS[0]
+
+
+@atexit.register
+def _release_context() -> None:
+    # Drop the shared context before the extension module is torn down, so
+    # nanobind does not report it as leaked at interpreter exit.
+    _CONTEXTS.clear()
+
+
+_MODULE_IDS = itertools.count()
+
+
+class Function[**P, R]:
+    """A function of a ``Module``, created by ``@module.function``,
+    ``@module.extern``, or ``@program.main``.
+
+    Call it from Python to run it (its module is compiled and linked on first
+    use); call it from a compiled function, in any module, to emit a call.
+    """
+
+    def __init__(
+        self,
+        module: Module,
+        python: Callable[P, R],
+        kind: Kind,
+        symbol: str | None = None,
+    ) -> None:
+        self.module = module
+        """The compilation module this function belongs to."""
+        self.python = python
+        """The decorated Python function (its source is what gets compiled)."""
+        self.kind: Kind = kind
+        """``"function"``, ``"extern"`` (defined elsewhere, e.g. libc), or ``"main"``."""
+        self.name = symbol or ("main" if kind == "main" else python.__name__)
+        """The symbol name in the compiled code."""
+
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
+        """Run the compiled function with Python values.
+
+        Raises:
+            CompileError: If a module does not compile.
+            TypeError: For wrong arguments, or when calling an extern.
+        """
+        if kwargs:
+            raise TypeError(f"{self.name}() takes positional arguments only")
+        if self.kind == "extern":
+            raise TypeError(
+                f"{self.name} is external; call it from a compiled function instead"
+            )
+        return cast(R, self.module._run(self, args))
+
+    def __repr__(self) -> str:
+        return f"<{self.kind} {self.name} of {self.module!r}>"
+
+
+class NamedExtern:
+    """The decorator returned by ``@module.extern(name=...)``."""
+
+    def __init__(self, module: Module, name: str) -> None:
+        self.module = module
+        self.name = name
+
+    def __call__[**P, R](self, python: Callable[P, R]) -> Function[P, R]:
+        return self.module._register(Function(self.module, python, "extern", self.name))
+
+
+@dataclass
+class _Build:
+    mlir: ir.Module
+    ops: dict[str, func.FuncOp]
+    signatures: dict[str, Signature]
+    variadic: dict[str, llvm.FunctionType]  # C variadic externs, e.g. printf
+    strings: dict[str, llvm.GlobalOp]
+    imports: dict[str, Module] = field(default_factory=dict)  # symbol -> module
+
+
+class Module:
+    """A compilation unit: functions compiled together, which other modules
+    can import and call.
+
+    Example::
+
+        # mathlib.py
+        mathlib = Module("mathlib")
+
+        @mathlib.function
+        def cube(x: i32) -> i32:
+            return x * x * x
+
+        # app.py
+        from mathlib import cube
+
+        program = Program()
+
+        @program.main
+        def main() -> i32:
+            return cube(3)          # linked in automatically
+    """
+
+    def __init__(self, name: str | None = None) -> None:
+        """Create an empty module.
+
+        Args:
+            name: Used in messages; the defining Python module's name by
+                default.
+        """
+        caller = sys._getframe(1).f_globals.get("__name__", "module")
+        self.name = name or caller
+        """The module's name (for messages)."""
+        self._id = next(_MODULE_IDS)
+        self._functions: dict[str, Function[..., Any]] = {}
+        self._build_state: _Build | None = None
+        self._version = 0
+        self._linked: tuple[tuple[int, ...], ir.Module] | None = None
+        self._compiled: tuple[tuple[int, ...], codegen.CompiledModule] | None = None
+
+    # -- defining functions ---------------------------------------------------
+
+    def function[**P, R](self, python: Callable[P, R]) -> Function[P, R]:
+        """Compile ``python`` as a function of this module.
+
+        Parameters and the result are typed by annotations (``i32``, ``f64``,
+        ``bool``, ``tuple[i32, i32]``, ...; ``int`` means ``i64`` and
+        ``float`` means ``f64``). The body is a subset of Python: arithmetic,
+        comparisons, ``if``/``while``/``for i in range(...)``, ``break``,
+        ``continue``, ``return``, and calls to functions of any module.
+        """
+        return self._register(Function(self, python, "function"))
+
+    @overload
+    def extern[**P, R](self, python: Callable[P, R], /) -> Function[P, R]: ...
+    @overload
+    def extern(self, /, *, name: str) -> NamedExtern: ...
+    def extern(
+        self, python: Callable[..., Any] | None = None, /, *, name: str | None = None
+    ) -> Function[..., Any] | NamedExtern:
+        """Declare a function defined elsewhere, such as C's ``puts``. Its
+        body must be ``...``; its annotations give the C signature
+        (``cstr`` for ``const char *``, ``*args`` for a variadic function).
+
+        ``@module.extern(name="printf")`` binds a Python name that differs
+        from the C symbol.
+        """
+        if python is not None:
+            return self._register(Function(self, python, "extern"))
+        if name is None:
+            raise TypeError("use @module.extern or @module.extern(name=...)")
+        return NamedExtern(self, name)
+
+    def _register[**P, R](self, function: Function[P, R]) -> Function[P, R]:
+        if function.name in self._functions:
+            raise ValueError(
+                f"{self.name} already has a function named '{function.name}'"
+            )
+        self._functions[function.name] = function
+        self._build_state = None
+        self._version += 1
+        return function
+
+    @property
+    def functions(self) -> list[Function[..., Any]]:
+        """The module's functions, in definition order."""
+        return list(self._functions.values())
+
+    @property
+    def imports(self) -> list[Module]:
+        """The modules whose functions this module calls."""
+        seen: dict[int, Module] = {}
+        for module in self._build().imports.values():
+            seen.setdefault(id(module), module)
+        return list(seen.values())
+
+    # -- results ----------------------------------------------------------------
+
+    @property
+    def mlir(self) -> ir.Module:
+        """This module alone as MLIR, imports appearing as declarations
+        (like an object file). Compiled on first access."""
+        return self._build().mlir
+
+    def __str__(self) -> str:
+        """This module as MLIR text."""
+        return str(self.mlir)
+
+    def linked(self) -> ir.Module:
+        """This module and everything it imports, transitively, linked into
+        one MLIR module (what runs and gets built).
+
+        Raises:
+            codegen.LinkError: If two modules define the same symbol.
+        """
+        modules = self._closure()
+        key = tuple(m._version for m in modules)
+        if self._linked is None or self._linked[0] != key:
+            self._linked = (key, _link(modules))
+        return self._linked[1]
+
+    def llvm_ir(
+        self, *, opt_level: codegen.OptLevel = codegen.OptLevel.O2
+    ) -> codegen.LLVMModule:
+        """The linked module as verified LLVM IR; ``print`` it to read it."""
+        return codegen.to_llvm_ir(self.linked(), opt_level=opt_level)
+
+    def build_shared_library(
+        self,
+        output: str | os.PathLike[str],
+        *,
+        opt_level: codegen.OptLevel = codegen.OptLevel.O2,
+        libraries: Sequence[str] = (),
+        linker: str | None = None,
+    ) -> Path:
+        """Build a native shared library exporting the functions of this
+        module and the modules it imports."""
+        return codegen.build_shared_library(
+            self.linked(),
+            output,
+            opt_level=opt_level,
+            libraries=libraries,
+            linker=linker,
+        )
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self.name!r}: {', '.join(self._functions) or 'empty'})"
+
+    # -- compilation ------------------------------------------------------------
+
+    def _build(self) -> _Build:
+        if self._build_state is not None:
+            return self._build_state
+        try:
+            with _context(), ir.Location.unknown():
+                return self._compile_all()
+        except BaseException:
+            self._build_state = None
+            raise
+
+    def _compile_all(self) -> _Build:
+        mlir = ir.Module()
+        sources: dict[str, Source] = {}
+        state = _Build(mlir, {}, {}, {}, {})
+        with ir.InsertionPoint(mlir.body):
+            for name, function in self._functions.items():
+                source = Source.of(function.python)
+                signature = signature_of(
+                    function.python, source, allow_variadic=function.kind == "extern"
+                )
+                sources[name] = source
+                state.signatures[name] = signature
+                with source.location(source.tree):
+                    if signature.variadic:
+                        state.variadic[name] = _declare_variadic(
+                            function.name, signature
+                        )
+                    else:
+                        state.ops[name] = self._declare(function, signature, source)
+        # Set before compiling bodies so calls within and across modules
+        # (including cycles) see every signature.
+        self._build_state = state
+        for name, function in self._functions.items():
+            if function.kind != "extern":
+                FunctionCompiler(
+                    self,
+                    function,
+                    state.ops[name],
+                    state.signatures[name],
+                    sources[name],
+                ).compile()
+        mlir.verify()
+        # Fold the SSA plumbing the compiler emits (one block argument per
+        # live variable, sign fixes for constant divisors, ...).
+        PassManager(ir.Module, [passes.Canonicalizer(), passes.CSE()]).run(mlir)
+        # The passes rewrote the module, so earlier handles are stale; look the
+        # functions up again.
+        state.ops = {
+            op.sym_name: op
+            for op in mlir.body.operations
+            if isinstance(op, func.FuncOp)
+        }
+        state.strings = {}
+        return state
+
+    def _declare(
+        self, function: Function[..., Any], signature: Signature, source: Source
+    ) -> func.FuncOp:
+        inputs = [kind.mlir() for _, kind in signature.params]
+        results = [kind.mlir() for kind in signature.results]
+        if function.kind == "extern":
+            body = [
+                s
+                for s in source.tree.body
+                if not (
+                    isinstance(s, ast.Expr)
+                    and isinstance(s.value, ast.Constant)
+                    and isinstance(s.value.value, str)
+                )
+            ]
+            if not (
+                len(body) == 1
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and body[0].value.value is ...
+            ):
+                raise source.error(
+                    source.tree, "an extern function's body must be '...'"
+                )
+            return func.declare(function.name, inputs, results)
+        if function.kind == "main":
+            if signature.params or signature.results not in ([], [i32]):
+                raise source.error(
+                    source.tree, "main takes no parameters and returns i32 or None"
+                )
+            results = [i32.mlir()]
+        return func.FuncOp(function.name, ir.FunctionType(inputs, results))
+
+    def _closure(self) -> list[Module]:
+        """This module and every module it imports, transitively."""
+        order: list[Module] = []
+        pending: list[Module] = [self]
+        while pending:
+            module = pending.pop()
+            if any(m is module for m in order):
+                continue
+            order.append(module)
+            pending.extend(module.imports)
+        return order
+
+    def _run(self, function: Function[..., Any], args: Sequence[object]) -> object:
+        state = self._build()
+        modules = self._closure()
+        key = tuple(m._version for m in modules)
+        if self._compiled is None or self._compiled[0] != key:
+            _check_externs_resolve(modules)
+            self._compiled = (key, codegen.compile(self.linked()))
+        linked = self.linked()
+        target = next(
+            op
+            for op in linked.body.operations
+            if isinstance(op, func.FuncOp) and op.sym_name == function.name
+        )
+        arguments = cast(Sequence[codegen.Argument], args)  # checked by the JIT
+        result = self._compiled[1].function(target)(*arguments)
+        if function.kind == "main" and not state.signatures[function.name].results:
+            return None
+        return result
+
+    # -- used by the function compiler ------------------------------------------
+
+    def declaration(
+        self, function: Function[..., Any]
+    ) -> tuple[func.FuncOp | None, Signature]:
+        """The callee and signature of ``function``, importing it when it
+        belongs to another module (no ``FuncOp`` for C variadic externs,
+        which are called through ``llvm.call``)."""
+        state = self._build_state
+        assert state is not None
+        if function.module is not self and function.name not in state.imports:
+            self._import(function, state)
+        return state.ops.get(function.name), state.signatures[function.name]
+
+    def _import(self, function: Function[..., Any], state: _Build) -> None:
+        """Declares another module's function here, as an external symbol."""
+        if function.name in state.signatures:
+            raise CompileError(
+                f"'{function.name}' is defined in {self.name} and also imported "
+                f"from {function.module.name}"
+            )
+        signature = function.module._build().signatures[function.name]
+        with ir.InsertionPoint(state.mlir.body):
+            if signature.variadic:
+                state.variadic[function.name] = _declare_variadic(
+                    function.name, signature
+                )
+            else:
+                state.ops[function.name] = func.declare(
+                    function.name,
+                    [kind.mlir() for _, kind in signature.params],
+                    [kind.mlir() for kind in signature.results]
+                    or ([i32.mlir()] if function.kind == "main" else []),
+                )
+        state.signatures[function.name] = signature
+        state.imports[function.name] = function.module
+
+    def variadic_type(self, function: Function[..., Any]) -> llvm.FunctionType:
+        self.declaration(function)
+        state = self._build_state
+        assert state is not None
+        return state.variadic[function.name]
+
+    def signature(self, function: Function[..., Any]) -> Signature:
+        return function.module._build().signatures[function.name]
+
+    def string_pointer(self, text: str) -> ir.Value:
+        """A pointer to a NUL-terminated constant holding ``text``."""
+        state = self._build_state
+        assert state is not None
+        if text not in state.strings:
+            with ir.InsertionPoint(state.mlir.body):
+                # Unique across modules, so linked modules cannot collide.
+                name = f".str.m{self._id}.{len(state.strings)}"
+                state.strings[text] = llvm.string_constant(name, text)
+        return llvm.address_of(state.strings[text])
+
+    def resolve_global(
+        self,
+        function: Function[..., Any],
+        name: str,
+        error: Callable[[], CompileError],
+    ) -> object:
+        """What ``name`` means in ``function``'s Python scope: its closure,
+        then its module's globals, then builtins, as Python resolves it. (Not
+        just names the bytecode uses: local annotations such as ``x: i32``
+        are never evaluated, so they are not in it.)"""
+        python = function.python
+        code = getattr(python, "__code__", None)
+        cells = cast(tuple[CellType, ...], getattr(python, "__closure__", None) or ())
+        if code is not None and name in code.co_freevars:
+            try:
+                return cells[code.co_freevars.index(name)].cell_contents
+            except ValueError:  # an unfilled cell
+                raise error() from None
+        scope = getattr(python, "__globals__", {})
+        if name in scope:
+            return scope[name]
+        if hasattr(builtins, name):
+            return getattr(builtins, name)
+        raise error()
+
+
+class Program(Module):
+    """A ``Module`` that can have an entry point and build executables.
+
+    Example::
+
+        program = Program()
+
+        @program.function
+        def add(a: i32, b: i32) -> i32:
+            return a + b
+
+        @program.main
+        def main() -> i32:
+            return add(2, 3)
+
+        add(2, 3)                         # 5, via the JIT
+        program.build_executable("app")
+    """
+
+    def main[**P, R](self, python: Callable[P, R]) -> Function[P, R]:
+        """Compile ``python`` as the program's entry point (the C ``main``),
+        whatever its Python name. It takes no parameters and returns ``i32``
+        (the exit status) or ``None`` (exit status 0)."""
+        if any(f.kind == "main" for f in self._functions.values()):
+            raise ValueError(f"{self.name} already has a main function")
+        return self._register(Function(self, python, "main"))
+
+    def build_executable(
+        self,
+        output: str | os.PathLike[str],
+        *,
+        opt_level: codegen.OptLevel = codegen.OptLevel.O2,
+        libraries: Sequence[str] = (),
+        linker: str | None = None,
+    ) -> Path:
+        """Build a native executable running the ``@program.main`` function,
+        linked with every module it imports.
+
+        Raises:
+            ValueError: If the program has no ``@program.main`` function.
+            codegen.LinkError: If linking fails.
+        """
+        if not any(f.kind == "main" for f in self._functions.values()):
+            raise ValueError(
+                "an executable needs an entry point: decorate one with @program.main"
+            )
+        return codegen.build_executable(
+            self.linked(),
+            output,
+            opt_level=opt_level,
+            libraries=libraries,
+            linker=linker,
+        )
+
+
+def _declare_variadic(name: str, signature: Signature) -> llvm.FunctionType:
+    """A C variadic function (``...``) is declared as an ``llvm.func``;
+    ``func.func`` cannot express variadic signatures."""
+    result = signature.results[0].mlir() if signature.results else llvm.VoidType()
+    function_type = llvm.FunctionType(
+        result, [kind.mlir() for _, kind in signature.params], variadic=True
+    )
+    llvm.LLVMFuncOp(name, function_type)
+    return function_type
+
+
+def _symbol(op: ir.Operation) -> tuple[str, bool] | None:
+    """(symbol name, is a definition) of a module-level operation."""
+    if isinstance(op, (func.FuncOp, llvm.LLVMFuncOp)):
+        return op.sym_name, len(op.body) > 0
+    if isinstance(op, llvm.GlobalOp):
+        return op.sym_name, True
+    return None
+
+
+def _link(modules: list[Module]) -> ir.Module:
+    """Combines modules into one: each definition once, declarations only for
+    symbols no module defines."""
+    with _context(), ir.Location.unknown():
+        linked = ir.Module()
+        definitions: dict[str, Module] = {}
+        declarations: dict[str, ir.Operation] = {}
+        for module in modules:
+            for op in module.mlir.body.operations:
+                symbol = _symbol(op)
+                if symbol is None:
+                    continue
+                name, is_definition = symbol
+                if not is_definition:
+                    declarations.setdefault(name, op)
+                    continue
+                if name in definitions:
+                    raise codegen.LinkError(
+                        f"'{name}' is defined in both {definitions[name].name} "
+                        f"and {module.name}"
+                    )
+                definitions[name] = module
+                linked.body.append(op.clone())
+        for name, op in declarations.items():
+            if name not in definitions:
+                linked.body.append(op.clone())
+        linked.verify()
+        return linked
+
+
+def _check_externs_resolve(modules: list[Module]) -> None:
+    """The JIT links externs against this process; name any that are missing
+    rather than failing with an opaque linker message."""
+    process = ctypes.CDLL(None)
+    for module in modules:
+        for function in module.functions:
+            if function.kind == "extern" and not hasattr(process, function.name):
+                raise codegen.LinkError(
+                    f"extern '{function.name}' of {module.name} is not defined in this "
+                    "process; check the C name (@module.extern(name=...)) or load its library"
+                )

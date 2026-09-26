@@ -1,0 +1,13 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# In-place development build of the extension (see MLIR_PYTHON_INPLACE)
+src/mlir_python/*.so

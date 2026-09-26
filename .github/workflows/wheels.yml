@@ -1,0 +1,96 @@
+# Builds self-contained wheels: LLVM and MLIR are compiled from the
+# third_party/llvm-project submodule and linked statically into the extension,
+# so installing the wheel needs nothing else. One abi3 wheel per platform
+# serves every CPython >= 3.12. A `v*` tag matching the version in
+# pyproject.toml publishes the wheels to a release and the package index.
+name: Wheels
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wheel:
+    name: Wheel (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    # A cold build compiles LLVM; ccache makes later builds much faster.
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true # shallow, like the checkout itself
+
+      - name: Check the tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $version in pyproject.toml"
+            exit 1
+          fi
+
+      - name: Restore compiler cache
+        uses: actions/cache@v6
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.arch }}-${{ hashFiles('.gitmodules') }}-${{ github.run_id }}
+          restore-keys: ccache-${{ matrix.arch }}-
+
+      - name: Build and test wheel
+        uses: pypa/cibuildwheel@v4.2.1
+        env:
+          CIBW_ARCHS: ${{ matrix.arch }}
+          # cibuildwheel mounts the runner's filesystem at /host, so the
+          # cache survives the container.
+          CIBW_ENVIRONMENT_LINUX: >-
+            CCACHE_DIR=/host${{ github.workspace }}/.ccache
+            CCACHE_BASEDIR=/project
+            CCACHE_MAXSIZE=2G
+            CMAKE_C_COMPILER_LAUNCHER=ccache
+            CMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-${{ matrix.arch }}
+          path: wheelhouse/*.whl
+
+  release:
+    name: Attach wheels to the release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: wheel
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: wheelhouse
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: wheelhouse/*.whl
+
+  index:
+    name: Publish the package index
+    needs: release
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/index.yml

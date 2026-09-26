@@ -1,0 +1,49 @@
+[project]
+name = "mlir-python"
+version = "0.1.0"
+description = "Typed nanobind bindings for the MLIR C++ API"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.13", "ruff>=0.16.9"]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+wheel.py-api = "cp312"
+wheel.packages = ["src/mlir_python"]
+# A fixed build directory lets compiler caches (see .github/workflows) hit.
+build-dir = "build/{wheel_tag}"
+
+[tool.cibuildwheel]
+# The wheel is abi3, so one build serves every CPython >= 3.12.
+build = "cp312-*"
+skip = "*-musllinux_*"
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+before-all = "dnf install -y epel-release && dnf install -y ccache"
+test-requires = ["pytest", "numpy"]
+# Run against the installed wheel rather than the sources in src/.
+test-command = "pytest {project}/tests -o pythonpath= -p no:cacheprovider"
+
+[tool.ruff.lint]
+ignore = ["PYI029", "PLC0414"]
+
+[dependency-groups]
+dev = [
+    "numpy>=2.2.6",
+    "pyrefly>=1.3.1",
+    "pytest>=8",
+    "ruff>=0.16.9",
+]
+
+[tool.uv]
+# The extension is built with CMake (`cmake --build build/dev`), which places
+# it in src/mlir_python; `uv build` still produces wheels.
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

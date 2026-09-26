@@ -1,0 +1,48 @@
+# Publishes a flat package index of every release's wheels to GitHub Pages.
+# Other projects install from it with
+#   uv:  [[tool.uv.index]] url = "https://OWNER.github.io/REPO/", format = "flat"
+#   pip: pip install mlir-python --find-links https://OWNER.github.io/REPO/
+# Requires Settings -> Pages -> Source: "GitHub Actions".
+name: Package index
+
+on:
+  # Runs after wheels.yml attaches wheels to a release, and whenever a release
+  # is changed by hand.
+  workflow_call:
+  release:
+    types: [published, edited, deleted]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  index:
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: List every release's wheels
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p site
+          gh api --paginate --slurp "repos/${{ github.repository }}/releases" \
+            | python3 tools/flat_index.py > site/index.html
+          cat site/index.html
+
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v5
