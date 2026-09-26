@@ -111,9 +111,16 @@ def _library(library: Library) -> str | Path:
                 "or a Path to a file"
             )
         return library
-    path = Path(library).resolve()
+    given = Path(library)
+    path = given.resolve()
     if not path.is_file():
-        raise FileNotFoundError(f"library {path} does not exist")
+        where = (
+            ""
+            if given.is_absolute()
+            else f" ('{given}' is relative to the current directory, {Path.cwd()}; "
+            "for a path next to your script use Path(__file__).parent / ...)"
+        )
+        raise FileNotFoundError(f"library {path} does not exist{where}")
     return path
 
 

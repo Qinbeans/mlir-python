@@ -1,5 +1,5 @@
-# Publishes a flat package index of every release's wheels to GitHub Pages.
-# Other projects install from it with
+# Publishes a flat package index of the wheels on every release of the
+# repositories below to GitHub Pages. Other projects install from it with
 #   uv:  [[tool.uv.index]] url = "https://qinbeans.github.io/mlir-python/", format = "flat"
 #   pip: pip install mlir-python --find-links https://qinbeans.github.io/mlir-python/
 # Requires Settings -> Pages -> Source: "GitHub Actions".
@@ -7,11 +7,23 @@ name: Package index
 
 on:
   # Runs after wheels.yml attaches wheels to a release, and whenever a release
-  # is changed by hand.
+  # here is changed by hand.
   workflow_call:
   release:
     types: [published, edited, deleted]
+  # Picks up the other repositories' releases, which cannot trigger this
+  # workflow without a token (send a `releases-changed` repository_dispatch
+  # with one for an immediate update).
+  schedule:
+    - cron: "17 * * * *"
+  repository_dispatch:
+    types: [releases-changed]
   workflow_dispatch:
+
+env:
+  REPOSITORIES: >-
+    Qinbeans/mlir-python
+    Qinbeans/tree-sitter-bifrost
 
 permissions:
   contents: read
@@ -36,8 +48,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p site
-          gh api --paginate --slurp "repos/${{ github.repository }}/releases" \
-            | python3 tools/flat_index.py > site/index.html
+          for repository in $REPOSITORIES; do
+            gh api --paginate --slurp "repos/$repository/releases"
+          done | python3 tools/flat_index.py > site/index.html
           cat site/index.html
 
       - uses: actions/configure-pages@v6
