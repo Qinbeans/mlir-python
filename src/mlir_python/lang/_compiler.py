@@ -352,8 +352,9 @@ class GraphBuilder:
         else:
             # `for x in xs`: evaluate xs once, then index it from 0 to len(xs).
             start, step = ast.Constant(0), ast.Constant(1)
+            # Every field is given: Python < 3.13 has no defaults for lists.
             stop = ast.Call(
-                ast.Name("len", ast.Load()), [ast.Name(sequence, ast.Load())]
+                ast.Name("len", ast.Load()), [ast.Name(sequence, ast.Load())], []
             )
 
         def located[T: ast.AST](new: T, like: ast.AST = node) -> T:
