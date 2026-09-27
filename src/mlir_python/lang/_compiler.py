@@ -32,12 +32,15 @@ from typing import TYPE_CHECKING, Any
 from .. import _mlir_python as ir
 from ..dialects import arith, cf, func, llvm, math
 from ._types import (
+    Fn,
+    FnType,
     Ptr,
     ScalarType,
     StructType,
     boolean,
     cstr,
     f64,
+    function_type,
     i32,
     i64,
     pointer_to,
@@ -468,7 +471,31 @@ def type_from_expression(
     if isinstance(node, ast.Subscript) and static_object(node.value, resolve) is Ptr:
         element = type_from_expression(node.slice, resolve)
         return pointer_to(element) if element is not None else None
+    if isinstance(node, ast.Subscript) and static_object(node.value, resolve) is Fn:
+        match node.slice:
+            case ast.Tuple(elts=[ast.List(elts=param_nodes), result_node]):
+                params = [type_from_expression(p, resolve) for p in param_nodes]
+                if any(p is None for p in params):
+                    return None
+                if isinstance(result_node, ast.Constant) and result_node.value is None:
+                    result = None
+                else:
+                    result = type_from_expression(result_node, resolve)
+                    if result is None:
+                        return None
+                return function_type([p for p in params if p is not None], result)
     return None
+
+
+def value_type(signature: Signature) -> FnType | None:
+    """The ``Fn`` type of a function with ``signature``, or ``None`` when no
+    function value can have it (several results, or C varargs)."""
+    if signature.returns_tuple or signature.variadic:
+        return None
+    return function_type(
+        [kind for _, kind in signature.params],
+        signature.results[0] if signature.results else None,
+    )
 
 
 def reverse_postorder(entry: Block) -> list[Block]:
@@ -709,7 +736,11 @@ class TypeInference:
             ):
                 return self.fresh(self.field_of(self.single(base), attr))
             case ast.Name() | ast.Attribute():
+                from ._program import Function
+
                 value = static_object(node, self.resolve)
+                if isinstance(value, Function):
+                    return self.fresh(value_type(value.module.signature(value)))
                 if isinstance(value, bool):
                     return self.fresh(boolean)
                 if isinstance(value, int):
@@ -748,6 +779,17 @@ class TypeInference:
                 a, b = self.single(body), self.single(orelse)
                 self.union(a, b)
                 return a
+            case ast.Call(func=ast.Name() | ast.Attribute() as callee, args=args) if (
+                is_runtime_value(callee, lambda name: ("var", name) in self.parent)
+            ):
+                # A call through a function value: `f(x)`, `handlers.on_key(x)`.
+                keys = [self.single(arg) for arg in args]
+                kind = self.fact[self.find(self.single(callee))]
+                if not isinstance(kind, FnType):
+                    return self.fresh(None)
+                for key, param in zip(keys, kind.params, strict=False):
+                    self.union(key, self.fresh(param))
+                return self.fresh(kind.result)
             case ast.Call(
                 func=ast.Name() | ast.Attribute() as callee,
                 args=args,
@@ -1251,7 +1293,7 @@ class FunctionCompiler:
         if isinstance(operand, Typed):
             if operand.type == kind:
                 return operand
-            if operand.type.kind in ("ptr", "cstr") and kind == ptr:
+            if operand.type.kind in ("ptr", "cstr", "fn") and kind == ptr:
                 return Typed(operand.value, kind)  # any pointer passes as a ptr
             if kind.kind == "struct" or operand.type.kind == "struct":
                 raise self.source.error(
@@ -1314,6 +1356,8 @@ class FunctionCompiler:
                 found = self.lookup_global(node)
                 if isinstance(found, (bool, int, float)):
                     return Literal(found)
+                if (address := self.function_address(found, node)) is not None:
+                    return address
                 raise self.source.error(
                     node, f"'{name}' cannot be used as a value here"
                 )
@@ -1332,6 +1376,8 @@ class FunctionCompiler:
                 found = static_object(node, self.resolve_quietly)
                 if isinstance(found, (bool, int, float)):
                     return Literal(found)
+                if (address := self.function_address(found, node)) is not None:
+                    return address
                 raise self.source.error(
                     node, f"'{ast.unparse(node)}' cannot be used as a value here"
                 )
@@ -1649,12 +1695,10 @@ class FunctionCompiler:
             if kind is None or len(node.args) != 1:
                 raise self.source.error(node, "use Ptr[T](pointer) to type a pointer")
             return self.convert(self.operand(node.args[0]), kind, node)
+        if is_runtime_value(node.func, self.is_local):
+            return self.call_value(node)
         if isinstance(node.func, ast.Name):
             name = node.func.id
-            if name in self.env or name in self.all_assigned:
-                raise self.source.error(
-                    node.func, f"'{name}' is a variable, not a function"
-                )
             target = self.lookup_global(node.func)
         elif isinstance(node.func, ast.Attribute):
             name = ast.unparse(node.func)
@@ -1695,6 +1739,70 @@ class FunctionCompiler:
         raise self.source.error(
             node.func, f"'{name}' cannot be called from compiled code"
         )
+
+    def function_address(self, target: object, node: ast.AST) -> Typed | None:
+        """``f`` used as a value: a pointer to the function, typed ``Fn[...]``
+        (``None`` if ``target`` is not a function)."""
+        from ._program import Function
+
+        if not isinstance(target, Function):
+            return None
+        callee, signature = self.program.declaration(target)
+        kind = value_type(signature)
+        if kind is None:
+            reason = "C varargs" if signature.variadic else "several results"
+            raise self.source.error(
+                node, f"{target.name} takes {reason}, so it cannot be a function value"
+            )
+        pointer = llvm.PointerType()
+        if target.kind == "extern":
+            if any(k.kind == "struct" for k in (*kind.params, kind.result) if k):
+                raise self.source.error(
+                    node,
+                    f"{target.name} passes a @struct by value, which calls through "
+                    "a function value cannot do the C way; wrap it in a function",
+                )
+            self.program.extern_abi(target)
+            return Typed(llvm.AddressOfOp(pointer, target.name).result, kind)
+        if target.kind == "main":
+            raise self.source.error(node, "main cannot be used as a function value")
+        assert callee is not None
+        constant = func.ConstantOp(callee.function_type, target.name).result
+        # Lowering to LLVM turns the constant into the function's address.
+        cast = ir.Operation.create(
+            "builtin.unrealized_conversion_cast", results=[pointer], operands=[constant]
+        )
+        return Typed(cast.results[0], kind)
+
+    def call_value(self, node: ast.Call) -> Operand | None:
+        """``f(x)`` where ``f`` holds a function value: an indirect call."""
+        callee = self.operand(node.func)
+        if not (isinstance(callee, Typed) and isinstance(callee.type, FnType)):
+            described = callee.type.name if isinstance(callee, Typed) else "a constant"
+            raise self.source.error(
+                node.func,
+                f"'{ast.unparse(node.func)}' is {described}, not a function value",
+            )
+        if node.keywords:
+            raise self.source.error(
+                node.keywords[0], "compiled calls take positional arguments only"
+            )
+        kind = callee.type
+        if len(node.args) != len(kind.params):
+            raise self.source.error(
+                node,
+                f"{ast.unparse(node.func)}() takes {len(kind.params)} arguments, "
+                f"got {len(node.args)}",
+            )
+        values = [
+            self.materialize(self.operand(arg), param, arg).value
+            for arg, param in zip(node.args, kind.params, strict=True)
+        ]
+        call = llvm.CallOp(
+            [callee.value, *values],
+            result_type=kind.result.mlir() if kind.result is not None else None,
+        )
+        return Typed(call.result, kind.result) if kind.result is not None else None
 
     def construct(self, kind: StructType, node: ast.Call) -> Typed:
         """``Color(r, g, b, a)`` or ``Color(r=..., ...)``: every field, once."""
@@ -1907,7 +2015,7 @@ class FunctionCompiler:
         if source.kind == "float" and kind.kind == "float":
             resize = arith.ExtFOp if kind.bits > source.bits else arith.TruncFOp
             return Typed(resize(target_type, value).result, kind)
-        if source.kind in ("ptr", "cstr") and kind.kind == "ptr":
+        if source.kind in ("ptr", "cstr", "fn") and kind.kind in ("ptr", "fn"):
             return Typed(value, kind)  # pointers are untyped in memory
         raise self.source.error(node, f"cannot convert {source.name} to {kind.name}")
 

@@ -7,12 +7,13 @@
 # runtime they are `ScalarType` objects that the compiler reads from
 # annotations (see types.py).
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal, TypeAlias, dataclass_transform
 
 from .._mlir_python import Type
 
-type Kind = Literal["int", "uint", "float", "bool", "ptr", "cstr", "struct"]
+type Kind = Literal["int", "uint", "float", "bool", "ptr", "cstr", "struct", "fn"]
 
 @dataclass(frozen=True)
 class ScalarType:
@@ -37,6 +38,15 @@ class StructType(ScalarType):
     python: type | None = None
     def offsets(self) -> list[int]: ...
     def field(self, name: str) -> tuple[int, ScalarType] | None: ...
+
+@dataclass(frozen=True)
+class FnType(ScalarType):
+    params: tuple[ScalarType, ...] = ()
+    result: ScalarType | None = None
+
+Fn: TypeAlias = Callable
+"""``Fn[[P1, P2], R]``: a function value (a C function pointer); to type
+checkers, ``Callable[[P1, P2], R]``."""
 
 i8: TypeAlias = int
 i16: TypeAlias = int

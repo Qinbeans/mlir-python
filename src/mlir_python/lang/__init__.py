@@ -47,6 +47,17 @@ value as C does)::
     @program.extern
     def ClearBackground(color: Color) -> None: ...
 
+Functions are values of type ``Fn[[params], result]`` (C function
+pointers): name one where a value is expected, call a value like a
+function, and pass them to C as callbacks::
+
+    @program.extern
+    def qsort(base: ptr, count: i64, size: i64, compare: Fn[[ptr, ptr], i32]) -> None: ...
+
+    @program.function
+    def apply(f: Fn[[i32], i32], x: i32) -> i32:
+        return f(x)                      # apply(double, 21)
+
 Split code across files with ``Module``: a compilation unit whose functions
 other modules import (``from mathlib import cube``) and call from compiled
 code; everything a program imports is linked in automatically. A ``Program``
@@ -59,6 +70,7 @@ The MLIR layer underneath stays available: ``module.mlir`` is an ordinary
 from ._compiler import CompileError
 from ._program import Function, Module, Program
 from .types import (
+    Fn,
     Ptr,
     cstr,
     f32,
@@ -78,6 +90,7 @@ from .types import (
 
 __all__ = [
     "CompileError",
+    "Fn",
     "Function",
     "Module",
     "Program",

@@ -11,6 +11,12 @@ ordinary, fully type-checked Python. Calling a type converts: ``i32(x)``,
 """
 
 from ._types import (
+    Fn as Fn,
+)
+from ._types import (
+    FnType as FnType,
+)
+from ._types import (
     Ptr as Ptr,
 )
 from ._types import (
@@ -63,6 +69,8 @@ from ._types import (
 )
 
 __all__ = [
+    "Fn",
+    "FnType",
     "Ptr",
     "ScalarType",
     "StructType",

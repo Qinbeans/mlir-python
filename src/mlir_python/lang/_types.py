@@ -23,7 +23,7 @@ from typing import Literal
 from .._mlir_python import F32Type, F64Type, IntegerType, Type
 from ..dialects import llvm
 
-type Kind = Literal["int", "uint", "float", "bool", "ptr", "cstr", "struct"]
+type Kind = Literal["int", "uint", "float", "bool", "ptr", "cstr", "struct", "fn"]
 
 
 @dataclass(frozen=True)
@@ -128,6 +128,54 @@ def stack(kind: object, count: int = 1) -> object:
     C's ``scanf``). It lives until the function returns."""
     del kind, count
     raise TypeError("stack() allocates memory in compiled code only")
+
+
+@dataclass(frozen=True)
+class FnType(ScalarType):
+    """A pointer to a function taking ``params`` and returning ``result``
+    (``None`` for nothing): ``Fn[[i32, i32], i32]``. It is a C function
+    pointer, so compiled functions can be passed to C and C callbacks can
+    be called."""
+
+    params: tuple[ScalarType, ...] = ()
+    result: ScalarType | None = None
+
+    def __call__(self, value: object) -> object:
+        raise TypeError(f"{self.name} values only exist in compiled code")
+
+
+class Fn:
+    """``Fn[[P1, P2, ...], R]``: a function value, e.g. ``Fn[[i32], i32]``
+    or ``Fn[[ptr], None]``. Name a function where a value is expected to
+    take its address (``apply(double, 21)``); call a value like a function
+    (``f(x)``). At runtime ``Fn[...]`` is an ``FnType``."""
+
+    def __class_getitem__(cls, item: object) -> FnType:
+        if not (
+            isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], list)
+        ):
+            raise TypeError(
+                "write Fn[[parameter types], result type], e.g. Fn[[i32], i32]"
+            )
+        params_given, result_given = item
+        params = [scalar_type(p) for p in params_given]
+        if any(p is None for p in params):
+            raise TypeError(
+                f"Fn[...] parameters must be machine types, got {params_given!r}"
+            )
+        no_result = result_given is None or result_given is type(None)
+        result = None if no_result else scalar_type(result_given)
+        if result is None and not no_result:
+            raise TypeError(
+                f"Fn[...] result must be a machine type or None, got {result_given!r}"
+            )
+        return function_type([p for p in params if p is not None], result)
+
+
+def function_type(params: list[ScalarType], result: ScalarType | None) -> FnType:
+    """The type ``Fn[params, result]``."""
+    name = f"Fn[[{', '.join(p.name for p in params)}], {result.name if result else 'None'}]"
+    return FnType(name, "fn", 64, None, tuple(params), result)
 
 
 cstr = ScalarType("cstr", "cstr", 64)
@@ -240,6 +288,8 @@ def struct[T](cls: type[T]) -> type[T]:
 
 
 __all__ = [
+    "Fn",
+    "FnType",
     "Ptr",
     "ScalarType",
     "StructType",
