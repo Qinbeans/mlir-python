@@ -21,7 +21,7 @@ namespace {
 /// on exit, which is off by one step and wrong when the loop never runs. It
 /// also accepts any loop-invariant step, but scf.for needs a positive one. This
 /// pattern uplifts only loops with a positive constant step, and then rewires
-/// that result to the exit value, `lb + ceildiv(max(ub - lb, 0), step) * step`.
+/// that result to the induction variable's value on exit.
 struct UpliftCountedWhile : public mlir::OpRewritePattern<mlir::scf::WhileOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -74,21 +74,21 @@ struct UpliftCountedWhile : public mlir::OpRewritePattern<mlir::scf::WhileOp> {
     if (!use)
       return mlir::success();
 
+    // Carry `iv + step` as an extra loop value: it is `lb` when the loop never
+    // runs and otherwise the first value that failed the condition, with the
+    // same wrapping arithmetic as the original loop.
     mlir::scf::ForOp forOp = *uplifted;
-    mlir::Location loc = forOp.getLoc();
-    mlir::Value lb = forOp.getLowerBound(), ub = forOp.getUpperBound();
-    step = forOp.getStep();
-    rewriter.setInsertionPointAfter(forOp);
-    mlir::Value zero = mlir::arith::ConstantOp::create(
-        rewriter, loc, rewriter.getZeroAttr(step.getType()));
-    mlir::Value span = mlir::arith::SubIOp::create(rewriter, loc, ub, lb);
-    span = mlir::arith::MaxSIOp::create(rewriter, loc, span, zero);
-    mlir::Value trips =
-        mlir::arith::CeilDivSIOp::create(rewriter, loc, span, step);
-    mlir::Value exit = mlir::arith::AddIOp::create(
-        rewriter, loc, lb,
-        mlir::arith::MulIOp::create(rewriter, loc, trips, step));
-    rewriter.replaceAllUsesWith(use->get(), exit);
+    mlir::Value lb = forOp.getLowerBound();
+    auto withExit = forOp.replaceWithAdditionalYields(
+        rewriter, lb, /*replaceInitOperandUsesInLoop=*/false,
+        [&](mlir::OpBuilder &b, mlir::Location loc,
+            llvm::ArrayRef<mlir::BlockArgument>) {
+          return llvm::SmallVector<mlir::Value>{mlir::arith::AddIOp::create(
+              b, loc, forOp.getInductionVar(), forOp.getStep())};
+        });
+    assert(mlir::succeeded(withExit) && "scf.for always takes more yields");
+    rewriter.replaceAllUsesWith(use->get(),
+                                (*withExit)->getResults().back());
     return mlir::success();
   }
 };

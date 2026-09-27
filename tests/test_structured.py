@@ -79,6 +79,41 @@ def collatz(n: i64) -> i64:
     return steps
 
 
+# The counter is read after the loop, so an uplifted scf.for must give it its
+# value on exit (the first one failing the condition), not its last in-loop one.
+@m.function
+def count_to_three() -> i64:
+    i = 0
+    while i < 3:
+        i = i + 1
+    return i
+
+
+@m.function
+def count_to(n: i64) -> i64:
+    i = 0
+    while i < n:
+        i = i + 1
+    return i
+
+
+@m.function
+def count_by_two(n: i64) -> i64:
+    i = 0
+    while i < n:
+        i += 2
+    return i
+
+
+@m.function
+def far_apart(low: i32, high: i32) -> i32:
+    # high - low overflows i32, so the exit value cannot come from the span.
+    i = low
+    while i < high:
+        i = i + 1_000_000_000
+    return i
+
+
 @m.function
 def sign(x: i32) -> i32:
     if x > 0:
@@ -96,6 +131,10 @@ CASES = [
     (skip_threes, [(0,), (10,)]),
     (countdown, [(0,), (9,), (10,)]),
     (collatz, [(1,), (27,)]),
+    (count_to_three, [()]),
+    (count_to, [(5,), (0,), (-3,)]),
+    (count_by_two, [(5,), (6,), (0,)]),
+    (far_apart, [(-2_000_000_000, 2_000_000_000), (5, 5), (5, -5)]),
     (sign, [(-5,), (0,), (3,)]),
 ]
 
@@ -137,6 +176,8 @@ def test_counted_loops_become_scf_for() -> None:
     assert ops("sum_of_squares").count("scf.for") == 1
     assert ops("stepped").count("scf.for") == 1
     assert ops("nested").count("scf.for") == 2
+    for counted in ("count_to_three", "count_to", "count_by_two", "far_apart"):
+        assert ops(counted).count("scf.for") == 1
     # Early exits keep a while loop, with the exit as a loop-carried flag.
     assert "scf.while" in ops("first_divisor")
     assert "scf.while" in ops("skip_threes")
