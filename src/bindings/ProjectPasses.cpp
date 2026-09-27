@@ -6,6 +6,7 @@
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/EmitC/IR/EmitC.h>
 #include <mlir/IR/BuiltinOps.h>
+#include <mlir/IR/Matchers.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
 #include <mlir/Dialect/SCF/Transforms/Patterns.h>
 #include <mlir/Pass/Pass.h>
@@ -13,6 +14,84 @@
 
 namespace mlir_python {
 namespace {
+
+/// Upstream's scf.while -> scf.for uplift, made correct for `while i < n`.
+/// Upstream sets the induction variable's loop result to its last value inside
+/// the loop (`lb + (ceildiv(ub - lb, step) - 1) * step`) rather than its value
+/// on exit, which is off by one step and wrong when the loop never runs. It
+/// also accepts any loop-invariant step, but scf.for needs a positive one. This
+/// pattern uplifts only loops with a positive constant step, and then rewires
+/// that result to the exit value, `lb + ceildiv(max(ub - lb, 0), step) * step`.
+struct UpliftCountedWhile : public mlir::OpRewritePattern<mlir::scf::WhileOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(mlir::scf::WhileOp loop,
+                  mlir::PatternRewriter &rewriter) const override {
+    // Find the induction variable and its step the way upstream does, only
+    // far enough to check the step; upstream rejects every other mismatch.
+    mlir::scf::ConditionOp condition = loop.getConditionOp();
+    auto cmp = condition.getCondition().getDefiningOp<mlir::arith::CmpIOp>();
+    if (!cmp)
+      return mlir::failure();
+    using Pred = mlir::arith::CmpIPredicate;
+    mlir::Value compared;
+    if (cmp.getPredicate() == Pred::slt)
+      compared = cmp.getLhs();
+    else if (cmp.getPredicate() == Pred::sgt)
+      compared = cmp.getRhs();
+    else
+      return mlir::failure();
+    auto induction = llvm::dyn_cast<mlir::BlockArgument>(compared);
+    if (!induction || induction.getOwner() != loop.getBeforeBody())
+      return mlir::failure();
+    // The loop result (and `after` argument) the condition forwards it to.
+    auto forwarded = llvm::find(condition.getArgs(), induction);
+    if (forwarded == condition.getArgs().end())
+      return mlir::failure();
+    unsigned result = std::distance(condition.getArgs().begin(), forwarded);
+    mlir::Value inLoop = loop.getAfterBody()->getArgument(result);
+    auto add = loop.getYieldOp()
+                   .getResults()[induction.getArgNumber()]
+                   .getDefiningOp<mlir::arith::AddIOp>();
+    if (!add)
+      return mlir::failure();
+    mlir::Value step = add.getLhs() == inLoop ? add.getRhs() : add.getLhs();
+    llvm::APInt stepValue;
+    if (!mlir::matchPattern(step, mlir::m_ConstantInt(&stepValue)) ||
+        !stepValue.isStrictlyPositive())
+      return mlir::failure();
+
+    // Upstream replaces the result's uses with its own value; remember one use
+    // to find that value afterwards.
+    mlir::OpOperand *use = nullptr;
+    if (!loop.getResult(result).use_empty())
+      use = &*loop.getResult(result).use_begin();
+    mlir::FailureOr<mlir::scf::ForOp> uplifted =
+        mlir::scf::upliftWhileToForLoop(rewriter, loop);
+    if (mlir::failed(uplifted))
+      return mlir::failure();
+    if (!use)
+      return mlir::success();
+
+    mlir::scf::ForOp forOp = *uplifted;
+    mlir::Location loc = forOp.getLoc();
+    mlir::Value lb = forOp.getLowerBound(), ub = forOp.getUpperBound();
+    step = forOp.getStep();
+    rewriter.setInsertionPointAfter(forOp);
+    mlir::Value zero = mlir::arith::ConstantOp::create(
+        rewriter, loc, rewriter.getZeroAttr(step.getType()));
+    mlir::Value span = mlir::arith::SubIOp::create(rewriter, loc, ub, lb);
+    span = mlir::arith::MaxSIOp::create(rewriter, loc, span, zero);
+    mlir::Value trips =
+        mlir::arith::CeilDivSIOp::create(rewriter, loc, span, step);
+    mlir::Value exit = mlir::arith::AddIOp::create(
+        rewriter, loc, lb,
+        mlir::arith::MulIOp::create(rewriter, loc, trips, step));
+    rewriter.replaceAllUsesWith(use->get(), exit);
+    return mlir::success();
+  }
+};
 
 struct UpliftWhileToFor
     : public mlir::PassWrapper<UpliftWhileToFor, mlir::OperationPass<>> {
@@ -28,7 +107,7 @@ struct UpliftWhileToFor
 
   void runOnOperation() override {
     mlir::RewritePatternSet patterns(&getContext());
-    mlir::scf::populateUpliftWhileToForPatterns(patterns);
+    patterns.add<UpliftCountedWhile>(&getContext());
     if (mlir::failed(
             mlir::applyPatternsGreedily(getOperation(), std::move(patterns))))
       signalPassFailure();
