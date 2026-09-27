@@ -1902,9 +1902,10 @@ class UpliftWhileToFor(Pass):
 
     Rewrites an `scf.while` loop whose condition compares an induction
     variable against a loop-invariant bound (`slt`/`sgt`) and whose body adds
-    a loop-invariant step into an `scf.for` loop, the form that later
+    a positive constant step into an `scf.for` loop, the form that later
     parallelization and vectorization expect. Other loops are left as they
-    are. Wraps MLIR's `populateUpliftWhileToForPatterns`.
+    are. Built on MLIR's `upliftWhileToForLoop`, but the induction variable's
+    loop result is its exit value (upstream gives its last in-loop value).
     """
 
     ARGUMENT: ClassVar[str] = "scf-uplift-while-to-for"
