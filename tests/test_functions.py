@@ -197,3 +197,36 @@ ERRORS = [
 @pytest.mark.parametrize(("source", "message"), ERRORS)
 def test_errors(source: str, message: str, tmp_path: Path) -> None:
     assert message in compile_error(source, tmp_path).msg
+
+
+@program.function
+def read_state(state: Ptr[i32], x: i32) -> i32:
+    return state[0] + x
+
+
+def test_typed_pointers_stand_for_opaque_ones_in_function_types() -> None:
+    # A function taking Ptr[i32] fits a callback type taking ptr (C's void *).
+    from mlir_python.lang._compiler import fits_function_type
+
+    assert fits_function_type(Fn[[Ptr[i32], i32], i32], Fn[[ptr, i32], i32])
+    assert fits_function_type(Fn[[ptr], None], Fn[[Ptr[i32]], None])
+    assert not fits_function_type(Fn[[Ptr[i32]], i32], Fn[[i32], i32])
+    assert not fits_function_type(Fn[[Ptr[i32]], i32], Fn[[ptr, ptr], i32])
+    assert not fits_function_type(Fn[[Ptr[i32]], i32], Fn[[Ptr[i64]], i32])
+    assert "read_state" in str(program.mlir)  # passing it compiles (see below)
+
+
+@program.function
+def pass_typed_callback(x: i32) -> i32:
+    slot = stack(i32)
+    slot[0] = 40
+    return apply_state(read_state, slot, x)
+
+
+@program.function
+def apply_state(handler: Fn[[ptr, i32], i32], state: ptr, x: i32) -> i32:
+    return handler(state, x)
+
+
+def test_passing_a_typed_callback() -> None:
+    assert pass_typed_callback(2) == 42

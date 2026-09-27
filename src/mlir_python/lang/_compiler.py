@@ -487,6 +487,32 @@ def type_from_expression(
     return None
 
 
+def fits_function_type(given: ScalarType, expected: ScalarType) -> bool:
+    """Whether a function of type ``given`` can be called as ``expected``: the
+    same shape, where a typed pointer (``Ptr[T]``) may stand for C's opaque
+    ``ptr`` (``void *``), so ``Fn[[Ptr[State]], None]`` passes as a callback
+    of type ``Fn[[ptr], None]``."""
+    if not (isinstance(given, FnType) and isinstance(expected, FnType)):
+        return False
+    if len(given.params) != len(expected.params):
+        return False
+
+    def same(a: ScalarType | None, b: ScalarType | None) -> bool:
+        if a == b:
+            return True
+        return (
+            a is not None
+            and b is not None
+            and a.kind == "ptr"
+            and b.kind == "ptr"
+            and ptr in (a, b)
+        )
+
+    return same(given.result, expected.result) and all(
+        same(a, b) for a, b in zip(given.params, expected.params, strict=True)
+    )
+
+
 def value_type(signature: Signature) -> FnType | None:
     """The ``Fn`` type of a function with ``signature``, or ``None`` when no
     function value can have it (several results, or C varargs)."""
@@ -1295,6 +1321,8 @@ class FunctionCompiler:
                 return operand
             if operand.type.kind in ("ptr", "cstr", "fn") and kind == ptr:
                 return Typed(operand.value, kind)  # any pointer passes as a ptr
+            if fits_function_type(operand.type, kind):
+                return Typed(operand.value, kind)
             if kind.kind == "struct" or operand.type.kind == "struct":
                 raise self.source.error(
                     node, f"expected {kind.name}, got {operand.type.name}"
