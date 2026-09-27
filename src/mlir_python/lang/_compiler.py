@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from .. import _mlir_python as ir
-from ..dialects import arith, cf, func, llvm, math, memref, scf
+from ..dialects import arith, async_dialect, cf, func, llvm, math, memref, scf
 from ._types import (
     ARRAY_ELEMENT_KINDS,
     Array,
@@ -40,6 +40,7 @@ from ._types import (
     Ptr,
     ScalarType,
     StructType,
+    Token,
     array,
     array_of,
     atomic_add,
@@ -80,7 +81,7 @@ class Source:
     first_line: int  # file line of the source's first line
     indent: int  # columns removed by dedenting
     lines: list[str]
-    tree: ast.FunctionDef
+    tree: ast.FunctionDef | ast.AsyncFunctionDef
 
     @staticmethod
     def of(fn: Callable[..., object]) -> Source:
@@ -96,7 +97,7 @@ class Source:
         indent = len(lines[0]) - len(lines[0].lstrip()) if lines else 0
         module = ast.parse(dedented)
         tree = module.body[0]
-        if not isinstance(tree, ast.FunctionDef):
+        if not isinstance(tree, (ast.FunctionDef, ast.AsyncFunctionDef)):
             raise CompileError(f"{fn.__qualname__} is not a plain function definition")
         return Source(filename, first_line, indent, lines, tree)
 
@@ -130,11 +131,19 @@ class Signature:
     results: list[ScalarType]
     returns_tuple: bool
     variadic: bool = False  # a C variadic function (``*args``), e.g. printf
+    is_async: bool = False  # an ``async def``: an ``async.func``
 
     def function_type(self) -> ir.FunctionType:
-        return ir.FunctionType(
-            [t.mlir() for _, t in self.params], [t.mlir() for t in self.results]
-        )
+        """The function's MLIR type; an async function returns its result as
+        an ``!async.value`` (an ``!async.token`` when it returns nothing)."""
+        results = [t.mlir() for t in self.results]
+        if self.is_async:
+            results = (
+                [async_dialect.ValueType(results[0])]
+                if results
+                else [async_dialect.TokenType()]
+            )
+        return ir.FunctionType([t.mlir() for _, t in self.params], results)
 
 
 def signature_of(
@@ -164,6 +173,7 @@ def signature_of(
             "only @program.extern functions can take *args (C variadic functions such as printf)",
         )
     variadic = arguments.vararg is not None
+    is_async = isinstance(source.tree, ast.AsyncFunctionDef)
     params = []
     for arg in [*arguments.posonlyargs, *arguments.args]:
         if arg.arg not in annotations:
@@ -180,8 +190,10 @@ def signature_of(
     result = annotations.get("return")
     node = source.tree.returns or source.tree
     if result is None or result is type(None):
-        return Signature(params, [], False, variadic)
+        return Signature(params, [], False, variadic, is_async)
     if isinstance(result, pytypes.GenericAlias) and result.__origin__ is tuple:
+        if is_async:
+            raise source.error(node, "an async function returns one value, not a tuple")
         results = [scalar_type(item) for item in result.__args__]
         if any(item is None for item in results):
             raise source.error(node, f"unsupported result type {result!r}")
@@ -189,7 +201,7 @@ def signature_of(
     kind = scalar_type(result)
     if kind is None:
         raise source.error(node, f"unsupported result type {result!r}")
-    return Signature(params, [kind], False, variadic)
+    return Signature(params, [kind], False, variadic, is_async)
 
 
 # ---------------------------------------------------------------------------
@@ -551,6 +563,12 @@ def value_type(signature: Signature) -> FnType | None:
     function value can have it (several results, or C varargs)."""
     if signature.returns_tuple or signature.variadic:
         return None
+    if signature.is_async:
+        # Its value starts it and returns its token (see
+        # ``FunctionCompiler.function_address``); results are not supported.
+        if signature.results:
+            return None
+        return function_type([kind for _, kind in signature.params], Token)
     return function_type(
         [kind for _, kind in signature.params],
         signature.results[0] if signature.results else None,
@@ -886,6 +904,12 @@ class TypeInference:
                 return self.call(static_object(callee, self.resolve), args, keywords)
             case ast.Call(func=ast.Subscript() as kind_node):  # Ptr[T](raw)
                 return self.fresh(type_from_expression(kind_node, self.resolve))
+            case ast.Await(value=awaited):
+                key = self.single(awaited)
+                fact = self.fact[self.find(key)]
+                if isinstance(fact, ScalarType) and fact.kind == "token":
+                    return self.fresh(None)  # a token completes with no value
+                return key
             case ast.Subscript(value=base, slice=index):
                 self.single(index)
                 return self.element_of(self.single(base))
@@ -1059,7 +1083,7 @@ class FunctionCompiler:
         self,
         program: Module,
         function: Function[..., Any],
-        op: func.FuncOp,
+        op: func.FuncOp | async_dialect.FuncOp,
         signature: Signature,
         source: Source,
     ) -> None:
@@ -1093,7 +1117,9 @@ class FunctionCompiler:
         self.display_types = inference.display_types()
         for name, kind in inferred.items():
             self.variable_types.setdefault(name, kind)
-        entry_block = self.op.add_entry_block()
+        entry_block = self.op.regions[0].append_block(
+            [kind.mlir() for _, kind in self.signature.params]
+        )
         self.entry_block = entry_block
         self.blocks[id(entry)] = entry_block
         self.block_arguments[id(entry)] = [name for name, _ in self.signature.params]
@@ -1338,6 +1364,8 @@ class FunctionCompiler:
             if is_main:
                 zero = arith.ConstantOp(ir.IntegerAttr(0, ir.IntegerType(32))).result
                 func.ReturnOp([zero])
+            elif self.signature.is_async:
+                async_dialect.ReturnOp([])
             else:
                 func.ReturnOp()
             return
@@ -1357,7 +1385,10 @@ class FunctionCompiler:
             if item is None:
                 raise self.source.error(ret.value, "this expression has no value")
             values.append(self.materialize(item, kind, ret.value).value)
-        func.ReturnOp(values)
+        if self.signature.is_async:
+            async_dialect.ReturnOp(values)
+        else:
+            func.ReturnOp(values)
 
     @staticmethod
     def describe(kinds: list[ScalarType]) -> str:
@@ -1526,6 +1557,8 @@ class FunctionCompiler:
                 return self.conditional(node)
             case ast.Call():
                 return self.call(node)
+            case ast.Await(value=awaited):
+                return self.await_(awaited, node)
             case ast.Subscript():
                 element, load, _ = self.element(node)
                 return Typed(load(), element)
@@ -1894,6 +1927,12 @@ class FunctionCompiler:
             return None
         callee, signature = self.program.declaration(target)
         kind = value_type(signature)
+        if kind is None and signature.is_async:
+            raise self.source.error(
+                node,
+                f"{target.name} is async and returns a value; only an async function "
+                "that returns nothing can be a function value (its value returns a Token)",
+            )
         if kind is None:
             reason = "C varargs" if signature.variadic else "several results"
             raise self.source.error(
@@ -1912,7 +1951,11 @@ class FunctionCompiler:
         if target.kind == "main":
             raise self.source.error(node, "main cannot be used as a function value")
         assert callee is not None
-        constant = func.ConstantOp(callee.function_type, target.name).result
+        if signature.is_async:
+            starter = self.program.task_starter(target, signature)
+            constant = func.ConstantOp(starter.function_type, starter.sym_name).result
+        else:
+            constant = func.ConstantOp(callee.function_type, target.name).result
         # Lowering to LLVM turns the constant into the function's address.
         cast = ir.Operation.create(
             "builtin.unrealized_conversion_cast", results=[pointer], operands=[constant]
@@ -1940,14 +1983,40 @@ class FunctionCompiler:
                 f"got {len(node.args)}",
             )
         values = [
-            self.materialize(self.operand(arg), param, arg).value
+            self.to_c(self.materialize(self.operand(arg), param, arg).value, param)
             for arg, param in zip(node.args, kind.params, strict=True)
         ]
         call = llvm.CallOp(
             [callee.value, *values],
-            result_type=kind.result.mlir() if kind.result is not None else None,
+            result_type=kind.result.c_type() if kind.result is not None else None,
         )
-        return Typed(call.result, kind.result) if kind.result is not None else None
+        if kind.result is None:
+            return None
+        return Typed(self.from_c(call.result, kind.result), kind.result)
+
+    @staticmethod
+    def to_c(value: ir.Value, kind: ScalarType) -> ir.Value:
+        """``value`` as C passes it: a ``Token`` as the pointer to its runtime object."""
+        if kind.kind != "token":
+            return value
+        cast = ir.Operation.create(
+            "builtin.unrealized_conversion_cast",
+            results=[llvm.PointerType()],
+            operands=[value],
+        )
+        return cast.results[0]
+
+    @staticmethod
+    def from_c(value: ir.Value, kind: ScalarType) -> ir.Value:
+        """A value C returned, as compiled code holds it (see ``to_c``)."""
+        if kind.kind != "token":
+            return value
+        cast = ir.Operation.create(
+            "builtin.unrealized_conversion_cast",
+            results=[kind.mlir()],
+            operands=[value],
+        )
+        return cast.results[0]
 
     def construct(self, kind: StructType, node: ast.Call) -> Typed:
         """``Color(r, g, b, a)`` or ``Color(r=..., ...)``: every field, once."""
@@ -1986,7 +2055,7 @@ class FunctionCompiler:
         return Typed(value, kind)
 
     def call_function(
-        self, target: Function[..., Any], node: ast.Call
+        self, target: Function[..., Any], node: ast.Call, *, awaited: bool = False
     ) -> Operand | TupleValue | None:
         callee, signature = self.program.declaration(target)
         fixed = len(signature.params)
@@ -2005,6 +2074,8 @@ class FunctionCompiler:
         if target.kind == "extern":
             extra = [self.promote(self.operand(arg), arg) for arg in node.args[fixed:]]
             return self.call_extern(target, values, extra)
+        if signature.is_async:
+            return self.call_async(target, signature, values, node, awaited=awaited)
         assert callee is not None
         results = func.call(callee, values).results
         typed = [
@@ -2016,6 +2087,71 @@ class FunctionCompiler:
         if signature.returns_tuple:
             return TupleValue(list(typed))
         return typed[0]
+
+    def call_async(
+        self,
+        target: Function[..., Any],
+        signature: Signature,
+        values: list[ir.Value],
+        node: ast.Call,
+        *,
+        awaited: bool,
+    ) -> Typed | None:
+        """Start an async function and wait for it: in an async function, by
+        pausing (``await f(x)``); elsewhere, by blocking until it is done."""
+        if self.signature.is_async and not awaited:
+            raise self.source.error(
+                node,
+                f"{target.name} is async; wait for it with `await {ast.unparse(node)}`",
+            )
+        handle = async_dialect.CallOp(
+            target.name, values, signature.function_type().results
+        ).results[0]
+        kind = signature.results[0] if signature.results else None
+        if self.signature.is_async:
+            if kind is None:
+                async_dialect.AwaitOp(handle)
+                return None
+            return Typed(
+                async_dialect.AwaitOp(handle, result_type=kind.mlir()).result, kind
+            )
+        # Blocking, spelled with runtime operations: `async.await` outside a
+        # coroutine lowers to `cf.assert`, which cannot lower when the program
+        # declares its own `puts` (the assertion's message printer).
+        async_dialect.RuntimeAwaitOp(handle)
+        failed = async_dialect.RuntimeIsErrorOp(handle).result
+        true = arith.ConstantOp(ir.BoolAttr(True)).result
+        self.check(arith.XOrIOp(failed, true).result, f"{target.name} failed", node)
+        if kind is None:
+            return None
+        return Typed(async_dialect.RuntimeLoadOp(handle).result, kind)
+
+    def await_(self, awaited: ast.expr, node: ast.Await) -> Operand | TupleValue | None:
+        """``await f(x)`` (an async function), or ``await token``."""
+        if isinstance(awaited, ast.Call) and isinstance(
+            awaited.func, (ast.Name, ast.Attribute)
+        ):
+            from ._program import Function
+
+            target = (
+                None
+                if is_runtime_value(awaited.func, self.is_local)
+                else self.lookup_global(awaited.func)
+                if isinstance(awaited.func, ast.Name)
+                else static_object(awaited.func, self.resolve_quietly)
+            )
+            if isinstance(target, Function) and target.kind != "extern":
+                if not self.program.signature(target).is_async:
+                    raise self.source.error(
+                        node,
+                        f"{target.name} is not async, so there is nothing to await",
+                    )
+                return self.call_function(target, awaited, awaited=True)
+        token = self.operand(awaited)
+        if not (isinstance(token, Typed) and token.type.kind == "token"):
+            raise self.source.error(node, "await an async function's call, or a Token")
+        async_dialect.AwaitOp(token.value)
+        return None
 
     def call_extern(
         self, target: Function[..., Any], values: list[ir.Value], extra: list[ir.Value]
@@ -2030,7 +2166,7 @@ class FunctionCompiler:
             operands.append(result_slot)
         for lowered, value in zip(abi.params, values, strict=True):
             if lowered.passing == "direct":
-                operands.append(value)
+                operands.append(self.to_c(value, lowered.kind))
                 continue
             slot = self.stack_slot(lowered.kind)
             llvm.StoreOp(value, slot)
@@ -2044,7 +2180,7 @@ class FunctionCompiler:
         result = abi.result
         result_type: ir.Type | None = None
         if result is not None and result.passing == "direct":
-            result_type = result.kind.mlir()
+            result_type = result.kind.c_type()
         elif result is not None and result.passing == "pieces":
             pieces = [piece for _, piece in result.pieces]
             result_type = pieces[0] if len(pieces) == 1 else llvm.StructType(pieces)
@@ -2063,7 +2199,7 @@ class FunctionCompiler:
             return None
         kind = result.kind
         if result.passing == "direct":
-            return Typed(call.result, kind)
+            return Typed(self.from_c(call.result, kind), kind)
         if result.passing == "byval":
             assert result_slot is not None
             return Typed(llvm.LoadOp(kind.mlir(), result_slot).result, kind)

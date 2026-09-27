@@ -92,7 +92,8 @@ def test_lowering_pipeline_is_typed_and_extensible() -> None:
     assert all(isinstance(p, (ir.Nested, codegen.passes.Pass)) for p in pipeline)
     assert str(ir.PassManager(ir.Module, pipeline)) == (
         "builtin.module(func.func(lower-vector-multi-reduction),"
-        "convert-vector-to-scf,async-to-async-runtime,async-runtime-ref-counting,"
+        "convert-vector-to-scf,async-func-to-async-runtime,async-to-async-runtime,"
+        "async-runtime-ref-counting,"
         "async-runtime-ref-counting-opt,convert-async-to-llvm,"
         "convert-bufferization-to-memref,convert-scf-to-cf,"
         "convert-vector-to-llvm,convert-to-llvm,reconcile-unrealized-casts)"

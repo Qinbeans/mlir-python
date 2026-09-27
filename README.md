@@ -185,6 +185,40 @@ print(program)                            # the MLIR; program.llvm_ir() for LLVM
   ```python
   raylib = Module("raylib", libraries=[Path("lib/libraylib.a"), "m"])
   ```
+- Pointers move as in C (`p + 1`, `p - n` on a `Ptr[T]`), and
+  `atomic_add(p, delta)` adds to an integer in memory in one indivisible,
+  sequentially consistent step, returning the old value (for reference counts
+  shared between threads).
+- Async functions: an `async def` compiles to an `async.func` (a coroutine),
+  and `await` waits for another async function or for a `Token`, pausing the
+  caller until it is ready. A plain function calling an async function blocks
+  until it is done. C functions can return a `Token` for something that
+  completes later (created and completed with the runtime's
+  `mlirAsyncRuntimeCreateToken` and `mlirAsyncRuntimeEmplaceToken`). An async
+  function that returns nothing is a function value of type `Fn[[...], Token]`:
+  C calls it to start it and gets the token to wait on, which is how an event
+  loop in C runs handlers written in Python:
+
+  ```python
+  @server.extern
+  def later(turns: i64) -> Token: ...          # completed by the event loop
+
+  @server.extern
+  def serve(handler: Fn[[i64], Token], requests: i64) -> i64: ...
+
+  @server.function
+  async def handle(request: i64) -> None:
+      await later(4 - request)                  # pauses; other handlers run
+      record(request)
+
+  @server.main
+  def main() -> i32:
+      return i32(serve(handle, 3))
+  ```
+
+  `build_executable(..., async_runtime=Path("libloop.so"))` links the runtime
+  (see [Async](#async)). Arrays do not mix with async yet: buffer
+  deallocation rejects async operations, so it runs only on code without them.
 - Mistakes raise `CompileError`, shown like a `SyntaxError` with the file,
   line, and a caret; reading a variable not assigned on every path is an error.
 - Split code across files with `Module`: a compilation unit whose functions

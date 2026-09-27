@@ -308,6 +308,7 @@ def llvm_lowering_pipeline() -> list[PipelineElement]:
     return [
         Nested(func.FuncOp, [passes.LowerVectorMultiReduction()]),
         passes.ConvertVectorToSCF(),
+        passes.AsyncFuncToAsyncRuntime(),
         passes.AsyncToAsyncRuntime(),
         passes.AsyncRuntimeRefCounting(),
         passes.AsyncRuntimeRefCountingOpt(),

@@ -7,13 +7,14 @@
 # runtime they are `ScalarType` objects that the compiler reads from
 # annotations (see types.py).
 
+from collections.abc import Generator
 from dataclasses import dataclass
 from typing import Any, Literal, TypeAlias, dataclass_transform
 
 from .._mlir_python import Type
 
 type Kind = Literal[
-    "int", "uint", "float", "bool", "ptr", "cstr", "struct", "array", "fn"
+    "int", "uint", "float", "bool", "ptr", "cstr", "struct", "array", "fn", "token"
 ]
 
 @dataclass(frozen=True)
@@ -23,6 +24,7 @@ class ScalarType:
     bits: int
     element: ScalarType | None = None
     def mlir(self) -> Type: ...
+    def c_type(self) -> Type: ...
     @property
     def is_integer(self) -> bool: ...
     @property
@@ -99,6 +101,14 @@ class Ptr[T](ptr):
     def __add__(self, count: int, /) -> Ptr[T]: ...
     def __sub__(self, count: int, /) -> Ptr[T]: ...
     def __setitem__(self, index: int, value: T) -> None: ...
+
+class Token:
+    """Something that completes later, such as a timer: ``await`` it in an
+    ``async def``. C functions may return one (``mlirAsyncRuntimeCreateToken``),
+    and complete it (``mlirAsyncRuntimeEmplaceToken``); an async function
+    that returns nothing, used as a function value, returns one."""
+
+    def __await__(self) -> Generator[Any]: ...
 
 def atomic_add[T: int](pointer: Ptr[T], delta: T, /) -> T:
     """Add ``delta`` to the integer ``pointer`` points at as one indivisible

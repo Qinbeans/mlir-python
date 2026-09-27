@@ -66,6 +66,16 @@ with ``atomic_add(p, delta)``, which returns the old value::
     def retain(count: Ptr[i64]) -> None:
         atomic_add(count, 1)
 
+``async def`` functions compile to coroutines: ``await`` another async
+function, or a ``Token`` a C function returns, to pause until it is ready
+(a plain function calling an async one waits for it). An async function
+that returns nothing is a function value of type ``Fn[[...], Token]``, which
+C can call to start it::
+
+    @program.function
+    async def handle(request: i64) -> None:
+        await later(request)             # later: an extern returning a Token
+
 Split code across files with ``Module``: a compilation unit whose functions
 other modules import (``from mathlib import cube``) and call from compiled
 code; everything a program imports is linked in automatically. A ``Program``
@@ -81,6 +91,7 @@ from .types import (
     Array,
     Fn,
     Ptr,
+    Token,
     array,
     atomic_add,
     cstr,
@@ -107,6 +118,7 @@ __all__ = [
     "Module",
     "Program",
     "Ptr",
+    "Token",
     "array",
     "atomic_add",
     "cstr",

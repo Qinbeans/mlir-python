@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast, overload
 from .. import _mlir_python as ir
 from .. import codegen, passes, pipelines
 from .._passes import PassManager, PipelineElement
-from ..dialects import func, llvm
+from ..dialects import async_dialect, func, llvm
 from ._abi import ExternABI, UnsupportedABI
 from ._abi import lower as lower_abi
 from ._compiler import (
@@ -149,7 +149,7 @@ class NamedExtern:
 @dataclass
 class _Build:
     mlir: ir.Module
-    ops: dict[str, func.FuncOp]
+    ops: dict[str, func.FuncOp | async_dialect.FuncOp]
     signatures: dict[str, Signature]
     externs: dict[str, ExternABI]  # C functions, called through llvm.call
     strings: dict[str, llvm.GlobalOp]
@@ -157,6 +157,8 @@ class _Build:
     # C functions the compiled code itself calls (e.g. to report a failed
     # check), declared once per module.
     runtime: dict[str, llvm.FunctionType] = field(default_factory=dict)
+    # Async functions' starters, for their function values (see task_starter).
+    starters: dict[str, func.FuncOp] = field(default_factory=dict)
 
 
 class Module:
@@ -296,7 +298,8 @@ class Module:
         if self._linked is None or self._linked[0] != key:
             with _context():
                 linked = _link(modules)
-                PassManager(ir.Module, pipelines.buffer_deallocation()).run(linked)
+                if _allocates(linked):
+                    PassManager(ir.Module, pipelines.buffer_deallocation()).run(linked)
                 _lower_atomics(linked)
             self._linked = (key, linked)
         return self._linked[1]
@@ -314,16 +317,19 @@ class Module:
         opt_level: codegen.OptLevel = codegen.OptLevel.O2,
         libraries: Sequence[codegen.Library] = (),
         linker: str | None = None,
+        async_runtime: codegen.Library | None = None,
     ) -> Path:
         """Build a native shared library exporting the functions of this
         module and the modules it imports, linked with their ``libraries``
-        and then ``libraries``."""
+        and then ``libraries`` (and, if it uses ``async``, ``async_runtime``:
+        the bundled runtime by default; see ``codegen.async_runtime``)."""
         return codegen.build_shared_library(
             self.linked(),
             output,
             opt_level=opt_level,
             libraries=[*self._all_libraries(), *libraries],
             linker=linker,
+            async_runtime=async_runtime,
         )
 
     def __repr__(self) -> str:
@@ -354,6 +360,11 @@ class Module:
                 sources[name] = source
                 state.signatures[name] = signature
                 with source.location(source.tree):
+                    if signature.is_async and function.kind != "function":
+                        what = "an extern" if function.kind == "extern" else "main"
+                        raise source.error(
+                            source.tree, f"{what} cannot be async; declare it with def"
+                        )
                     if function.kind == "extern":
                         _check_extern(signature, source)
                         state.externs[name] = _declare_extern(
@@ -380,14 +391,16 @@ class Module:
         state.ops = {
             op.sym_name: op
             for op in mlir.body.operations
-            if isinstance(op, func.FuncOp)
+            if isinstance(op, (func.FuncOp, async_dialect.FuncOp))
         }
         state.strings = {}
         return state
 
     def _declare(
         self, function: Function[..., Any], signature: Signature
-    ) -> func.FuncOp:
+    ) -> func.FuncOp | async_dialect.FuncOp:
+        if signature.is_async:
+            return async_dialect.FuncOp(function.name, signature.function_type())
         inputs = [kind.mlir() for _, kind in signature.params]
         results = [kind.mlir() for kind in signature.results]
         if function.kind == "main":
@@ -427,6 +440,11 @@ class Module:
     def _run(self, function: Function[..., Any], args: Sequence[object]) -> object:
         state = self._build()
         signature = state.signatures[function.name]
+        if signature.is_async:
+            raise TypeError(
+                f"{function.name} is async; call it from a compiled function, "
+                "which waits for it"
+            )
         structs = [k for _, k in signature.params] + signature.results
         if any(kind.kind == "struct" for kind in structs):
             raise TypeError(
@@ -473,7 +491,7 @@ class Module:
 
     def declaration(
         self, function: Function[..., Any]
-    ) -> tuple[func.FuncOp | None, Signature]:
+    ) -> tuple[func.FuncOp | async_dialect.FuncOp | None, Signature]:
         """The callee and signature of ``function``, importing it when it
         belongs to another module (no ``FuncOp`` for externs, which are
         called through ``llvm.call``; see ``extern_abi``)."""
@@ -498,6 +516,10 @@ class Module:
                     state.externs[function.name] = _declare_extern(
                         function.name, signature, source
                     )
+            elif signature.is_async:
+                state.ops[function.name] = async_dialect.FuncOp(
+                    function.name, signature.function_type(), sym_visibility="private"
+                )
             else:
                 state.ops[function.name] = func.declare(
                     function.name,
@@ -507,6 +529,45 @@ class Module:
                 )
         state.signatures[function.name] = signature
         state.imports[function.name] = function.module
+
+    def task_starter(
+        self, function: Function[..., Any], signature: Signature
+    ) -> func.FuncOp:
+        """A plain function that starts the async ``function`` and returns its
+        ``Token``: what an async function's value points to, so C can call it
+        (defined once per module that takes the value, and private to it)."""
+        state = self._build_state
+        assert state is not None
+        name = f"{function.name}.task.m{self._id}"
+        existing = state.starters.get(name)
+        if existing is not None:
+            return existing
+        task_type = signature.function_type()
+        # It returns the token as C holds it, a pointer: `func.constant`
+        # keeps its type when lowering rewrites a function's `!async.token`.
+        pointer = llvm.PointerType()
+        with ir.InsertionPoint(state.mlir.body), ir.Location.unknown():
+            starter = func.FuncOp(
+                name,
+                ir.FunctionType(task_type.inputs, [pointer]),
+                sym_visibility="private",
+            )
+            block = starter.add_entry_block()
+            with ir.InsertionPoint(block):
+                token = async_dialect.CallOp(
+                    function.name, list(block.arguments), task_type.results
+                ).results[0]
+                # One reference for the caller: reference counting drops the
+                # token's own after its last use here.
+                async_dialect.RuntimeAddRefOp(token, 1)
+                cast = ir.Operation.create(
+                    "builtin.unrealized_conversion_cast",
+                    results=[pointer],
+                    operands=[token],
+                )
+                func.ReturnOp(cast.results)
+        state.starters[name] = starter
+        return starter
 
     def extern_abi(self, function: Function[..., Any]) -> ExternABI:
         """How calls to the extern ``function`` pass values (the C ABI)."""
@@ -613,10 +674,12 @@ class Program(Module):
         opt_level: codegen.OptLevel = codegen.OptLevel.O2,
         libraries: Sequence[codegen.Library] = (),
         linker: str | None = None,
+        async_runtime: codegen.Library | None = None,
     ) -> Path:
         """Build a native executable running the ``@program.main`` function,
         linked with every module it imports, their ``libraries``, and then
-        ``libraries``.
+        ``libraries`` (and, if it uses ``async``, ``async_runtime``: the
+        bundled runtime by default; see ``codegen.async_runtime``).
 
         Raises:
             ValueError: If the program has no ``@program.main`` function.
@@ -632,6 +695,7 @@ class Program(Module):
             opt_level=opt_level,
             libraries=[*self._all_libraries(), *libraries],
             linker=linker,
+            async_runtime=async_runtime,
         )
 
 
@@ -680,8 +744,8 @@ def _declare_extern(name: str, signature: Signature, source: Source) -> ExternAB
 
 def _symbol(op: ir.Operation) -> tuple[str, bool] | None:
     """(symbol name, is a definition) of a module-level operation."""
-    if isinstance(op, (func.FuncOp, llvm.LLVMFuncOp)):
-        return op.sym_name, len(op.body) > 0
+    if isinstance(op, (func.FuncOp, llvm.LLVMFuncOp, async_dialect.FuncOp)):
+        return op.sym_name, len(op.regions[0].blocks) > 0
     if isinstance(op, llvm.GlobalOp):
         return op.sym_name, True
     return None
@@ -715,6 +779,21 @@ def _link(modules: list[Module]) -> ir.Module:
                 linked.body.append(op.clone())
         linked.verify()
         return linked
+
+
+def _allocates(module: ir.Module) -> bool:
+    """Whether ``module`` allocates arrays, which buffer deallocation frees.
+    (It is skipped otherwise: it rejects operations whose memory effects it
+    cannot see, such as ``async.await``, so arrays and ``async`` do not mix yet.)"""
+    found = False
+
+    def visit(op: ir.Operation) -> None:
+        nonlocal found
+        found = found or op.name == "memref.alloc"
+
+    for op in module.body.operations:
+        op.walk(visit)
+    return found
 
 
 def _lower_atomics(module: ir.Module) -> None:

@@ -242,13 +242,13 @@ def lower(
             types = [t for _, t in lowered_result.pieces]
             output = types[0] if len(types) == 1 else llvm.StructType(types)
         else:
-            output = kind.mlir()
+            output = kind.c_type()
             if extension := _extension(kind):
                 res_attrs = ir.ArrayAttr([ir.DictAttr(extension)])
     for item in lowered_params:
         assert item is not None
         if item.passing == "direct":
-            inputs.append(item.kind.mlir())
+            inputs.append(item.kind.c_type())
             attrs.append(ir.DictAttr(_extension(item.kind)))
         elif item.passing == "pieces":
             for _, piece in item.pieces:

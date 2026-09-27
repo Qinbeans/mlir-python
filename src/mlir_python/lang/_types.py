@@ -21,10 +21,10 @@ from dataclasses import dataclass
 from typing import Literal
 
 from .._mlir_python import F32Type, F64Type, IntegerType, MemRefType, Type
-from ..dialects import llvm
+from ..dialects import async_dialect, llvm
 
 type Kind = Literal[
-    "int", "uint", "float", "bool", "ptr", "cstr", "struct", "array", "fn"
+    "int", "uint", "float", "bool", "ptr", "cstr", "struct", "array", "fn", "token"
 ]
 
 
@@ -57,7 +57,13 @@ class ScalarType:
             return IntegerType(1)
         if self.kind == "float":
             return F32Type() if self.bits == 32 else F64Type()
+        if self.kind == "token":
+            return async_dialect.TokenType()
         return llvm.PointerType()
+
+    def c_type(self) -> Type:
+        """How C sees this type: a ``Token`` is a pointer to a runtime object."""
+        return llvm.PointerType() if self.kind == "token" else self.mlir()
 
     @property
     def is_integer(self) -> bool:
@@ -105,6 +111,11 @@ f64 = ScalarType("f64", "float", 64)
 boolean = ScalarType("bool", "bool", 1)
 ptr = ScalarType("ptr", "ptr", 64)
 """An opaque pointer, as returned by C functions such as ``malloc``."""
+Token = ScalarType("Token", "token", 64)
+"""Something that completes later, such as a timer or a read: ``await`` it in
+an ``async def``. An async function returning nothing gives one as its
+function value's result; a C function can return one (created with
+``mlirAsyncRuntimeCreateToken``, completed with ``mlirAsyncRuntimeEmplaceToken``)."""
 
 
 class Ptr:
@@ -360,6 +371,7 @@ __all__ = [
     "Ptr",
     "ScalarType",
     "StructType",
+    "Token",
     "array",
     "atomic_add",
     "cstr",
