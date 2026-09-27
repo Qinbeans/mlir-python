@@ -35,6 +35,9 @@ from ._types import (
     array as array,
 )
 from ._types import (
+    atomic_add as atomic_add,
+)
+from ._types import (
     cstr as cstr,
 )
 from ._types import (
@@ -86,6 +89,7 @@ __all__ = [
     "ScalarType",
     "StructType",
     "array",
+    "atomic_add",
     "cstr",
     "f32",
     "f64",

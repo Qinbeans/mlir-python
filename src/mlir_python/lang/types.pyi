@@ -90,12 +90,20 @@ class Fn[**P, R](ptr):
 
 class Ptr[T](ptr):
     """A pointer to ``T`` values, e.g. ``Ptr[i32]``. Index it to read and
-    write (``p[0]``, ``p[i] = x``); ``Ptr[T](raw)`` types an opaque ``ptr``.
+    write (``p[0]``, ``p[i] = x``); ``p + n`` and ``p - n`` point ``n`` values
+    further or back, as in C; ``Ptr[T](raw)`` types an opaque ``ptr``.
     Any ``Ptr[T]`` passes where a ``ptr`` is expected."""
 
     def __init__(self, address: ptr | Ptr[Any] | list[T], /) -> None: ...
     def __getitem__(self, index: int) -> T: ...
+    def __add__(self, count: int, /) -> Ptr[T]: ...
+    def __sub__(self, count: int, /) -> Ptr[T]: ...
     def __setitem__(self, index: int, value: T) -> None: ...
+
+def atomic_add[T: int](pointer: Ptr[T], delta: T, /) -> T:
+    """Add ``delta`` to the integer ``pointer`` points at as one indivisible
+    step (sequentially consistent, safe across threads); return the value it
+    held before, e.g. for a reference count."""
 
 def stack[T](kind: type[T], count: int = 1) -> Ptr[T]:
     """Memory for ``count`` values of type ``kind`` on the compiled function's

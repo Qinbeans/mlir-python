@@ -58,6 +58,14 @@ function, and pass them to C as callbacks::
     def apply(f: Fn[[i32], i32], x: i32) -> i32:
         return f(x)                      # apply(double, 21)
 
+Point into memory with ``Ptr[T]``: index it (``p[i]``), move it as C
+does (``p + 1``, ``p - n``), and update shared integers from several threads
+with ``atomic_add(p, delta)``, which returns the old value::
+
+    @program.function
+    def retain(count: Ptr[i64]) -> None:
+        atomic_add(count, 1)
+
 Split code across files with ``Module``: a compilation unit whose functions
 other modules import (``from mathlib import cube``) and call from compiled
 code; everything a program imports is linked in automatically. A ``Program``
@@ -74,6 +82,7 @@ from .types import (
     Fn,
     Ptr,
     array,
+    atomic_add,
     cstr,
     f32,
     f64,
@@ -99,6 +108,7 @@ __all__ = [
     "Program",
     "Ptr",
     "array",
+    "atomic_add",
     "cstr",
     "f32",
     "f64",

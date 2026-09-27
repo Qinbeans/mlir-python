@@ -42,6 +42,7 @@ from ._types import (
     StructType,
     array,
     array_of,
+    atomic_add,
     boolean,
     cstr,
     f64,
@@ -56,6 +57,9 @@ from ._types import (
 
 if TYPE_CHECKING:
     from ._program import Function, Module
+
+ATOMIC_ADD = "__mlir_python_atomic_add_i"
+"""Prefix of the placeholder that ``atomic_add`` calls until linking."""
 
 
 class CompileError(SyntaxError):
@@ -833,6 +837,9 @@ class TypeInference:
                 return [self.single(e) for e in elements]
             case ast.BinOp(left=left, op=op, right=right):
                 a, b = self.single(left), self.single(right)
+                fact = self.fact[self.find(a)]
+                if isinstance(fact, ScalarType) and fact.kind == "ptr":
+                    return a  # `p + n`: a pointer, moved by a count of any integer type
                 self.union(a, b)
                 if isinstance(op, ast.Div):
                     fact = self.fact[self.find(a)]
@@ -933,6 +940,10 @@ class TypeInference:
             return self.fresh(kind)
         if target is builtins.abs and keys:
             return keys[0]
+        if target is atomic_add and len(keys) == 2:
+            element = self.element_of(keys[0])
+            self.union(element, keys[1])
+            return element
         if target in (builtins.min, builtins.max) and keys:
             for key in keys[1:]:
                 self.union(keys[0], key)
@@ -1547,6 +1558,8 @@ class FunctionCompiler:
         self, op: ast.operator, left: Operand, right: Operand, node: ast.AST
     ) -> Operand:
         symbol = SYMBOLS.get(type(op), type(op).__name__)
+        if isinstance(left, Typed) and left.type.kind == "ptr":
+            return self.pointer_offset(op, left, right, node)
         for side in (left, right):
             if isinstance(side, Typed) and side.type.kind in ("struct", "array"):
                 raise self.source.error(
@@ -1851,6 +1864,8 @@ class FunctionCompiler:
             return self.convert(self.operand(node.args[0]), kind, node)
         if target is stack:
             return self.allocate(node)
+        if target is atomic_add:
+            return self.atomic_add(node)
         if target is array:
             return self.make_array(node)
         if target is builtins.len:
@@ -2370,6 +2385,57 @@ class FunctionCompiler:
             [offset],
         ).result
         return address, element
+
+    def pointer_offset(
+        self, op: ast.operator, base: Typed, count: Operand, node: ast.AST
+    ) -> Typed:
+        """``p + n`` and ``p - n``: the address ``n`` values further or back."""
+        if base.type.element is None or not isinstance(op, (ast.Add, ast.Sub)):
+            raise self.source.error(
+                node, "pointer arithmetic is p + n or p - n on a typed pointer (Ptr[T])"
+            )
+        if (isinstance(count, Typed) and not count.type.is_integer) or (
+            isinstance(count, Literal) and type(count.value) is not int
+        ):
+            raise self.source.error(node, "a pointer moves by an integer count")
+        offset = self.convert(count, i64, node).value
+        if isinstance(op, ast.Sub):
+            zero = self.materialize(Literal(0), i64, node).value
+            offset = arith.SubIOp(zero, offset).result
+        dynamic = -(2**31)  # LLVM::GEPOp::kDynamicIndex
+        address = llvm.GEPOp(
+            llvm.PointerType(),
+            base.value,
+            ir.DenseI32ArrayAttr([dynamic]),
+            base.type.element.mlir(),
+            [offset],
+        ).result
+        return Typed(address, base.type)
+
+    def atomic_add(self, node: ast.Call) -> Operand:
+        """``atomic_add(p, delta)``: one indivisible read-add-write; the old value."""
+        if len(node.args) != 2:
+            raise self.source.error(node, "atomic_add() takes a pointer and an amount")
+        pointer = self.operand(node.args[0])
+        element = pointer.type.element if isinstance(pointer, Typed) else None
+        if element is None or not element.is_integer or pointer.type.kind != "ptr":
+            raise self.source.error(
+                node.args[0],
+                "atomic_add() takes a pointer to an integer, like Ptr[i64]",
+            )
+        delta = self.materialize(self.operand(node.args[1]), element, node.args[1])
+        # A call for now, which buffer deallocation accepts (it rejects
+        # llvm.atomicrmw, whose memory effects it cannot see); linking
+        # replaces it with the atomic instruction (see _program._lower_atomics).
+        integer = element.mlir()
+        name = f"{ATOMIC_ADD}{element.bits}"
+        self.program.runtime_function(
+            name, llvm.FunctionType(integer, [llvm.PointerType(), integer])
+        )
+        call = llvm.CallOp(
+            [pointer.value, delta.value], callee=name, result_type=integer
+        )
+        return Typed(call.result, element)
 
     def absolute(self, node: ast.Call) -> Operand:
         if len(node.args) != 1:

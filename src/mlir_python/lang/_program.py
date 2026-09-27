@@ -30,7 +30,14 @@ from .._passes import PassManager, PipelineElement
 from ..dialects import func, llvm
 from ._abi import ExternABI, UnsupportedABI
 from ._abi import lower as lower_abi
-from ._compiler import CompileError, FunctionCompiler, Signature, Source, signature_of
+from ._compiler import (
+    ATOMIC_ADD,
+    CompileError,
+    FunctionCompiler,
+    Signature,
+    Source,
+    signature_of,
+)
 from ._types import ScalarType, i32
 
 type Kind = Literal["function", "extern", "main"]
@@ -290,6 +297,7 @@ class Module:
             with _context():
                 linked = _link(modules)
                 PassManager(ir.Module, pipelines.buffer_deallocation()).run(linked)
+                _lower_atomics(linked)
             self._linked = (key, linked)
         return self._linked[1]
 
@@ -707,6 +715,35 @@ def _link(modules: list[Module]) -> ir.Module:
                 linked.body.append(op.clone())
         linked.verify()
         return linked
+
+
+def _lower_atomics(module: ir.Module) -> None:
+    """Replace each placeholder call ``atomic_add`` compiled to with
+    ``llvm.atomicrmw add`` (sequentially consistent), and drop the
+    placeholders' declarations."""
+    calls: list[ir.Operation] = []
+    declarations: list[ir.Operation] = []
+
+    def visit(op: ir.Operation) -> None:
+        attribute = {"llvm.call": "callee", "llvm.func": "sym_name"}.get(op.name)
+        if attribute is None or attribute not in op.attributes:
+            return  # not a call, or an indirect one
+        symbol = str(op.attributes[attribute]).lstrip("@").strip('"')
+        if symbol.startswith(ATOMIC_ADD):
+            (calls if op.name == "llvm.call" else declarations).append(op)
+
+    for op in module.body.operations:
+        op.walk(visit)
+    for call in calls:
+        with ir.InsertionPoint.before(call), call.location:
+            pointer, delta = call.operands[0], call.operands[1]
+            atomic = llvm.AtomicRMWOp(
+                llvm.AtomicBinOp.ADD, pointer, delta, llvm.AtomicOrdering.SEQ_CST
+            )
+        call.results[0].replace_all_uses_with(atomic.result)
+        call.erase()
+    for declaration in declarations:
+        declaration.erase()
 
 
 def _to_buffer(value: object, kind: ScalarType) -> object:

@@ -109,7 +109,8 @@ ptr = ScalarType("ptr", "ptr", 64)
 
 class Ptr:
     """``Ptr[T]``: a pointer to ``T`` values, e.g. ``Ptr[i32]``. Index it to
-    read and write (``p[0]``, ``p[i] = x``); ``Ptr[T](raw)`` types an opaque
+    read and write (``p[0]``, ``p[i] = x``); ``p + n`` and ``p - n`` point
+    ``n`` values further or back, as in C; ``Ptr[T](raw)`` types an opaque
     ``ptr``. At runtime ``Ptr[T]`` is a pointer ``ScalarType``."""
 
     def __class_getitem__(cls, element: object) -> ScalarType:
@@ -178,6 +179,14 @@ def stack(kind: object, count: int = 1) -> object:
     C's ``scanf``). It lives until the function returns."""
     del kind, count
     raise TypeError("stack() allocates memory in compiled code only")
+
+
+def atomic_add(pointer: object, delta: object) -> object:
+    """``atomic_add(p, delta)``: add ``delta`` to the integer ``p`` points at
+    as one indivisible step (sequentially consistent, safe across threads),
+    and return the value it held before, e.g. for a reference count."""
+    del pointer, delta
+    raise TypeError("atomic_add() works on memory in compiled code only")
 
 
 @dataclass(frozen=True)
@@ -352,6 +361,7 @@ __all__ = [
     "ScalarType",
     "StructType",
     "array",
+    "atomic_add",
     "cstr",
     "f32",
     "f64",
