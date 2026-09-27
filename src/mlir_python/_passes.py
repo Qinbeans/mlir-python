@@ -8,14 +8,22 @@ accepts that syntax directly as a fallback.
 
 from __future__ import annotations
 
+import atexit
 import dataclasses
 import enum
 from collections.abc import Sequence
 from typing import ClassVar
 
-from ._mlir_python import Context, Module, Operation, ParsedPassPipeline
+from ._mlir_python import (
+    Context,
+    Module,
+    Operation,
+    ParsedPassPipeline,
+    register_python_pass,
+    release_python_passes,
+)
 
-__all__ = ["Nested", "Pass", "PassManager", "PipelineElement"]
+__all__ = ["Nested", "Pass", "PassManager", "PipelineElement", "PythonPass"]
 
 
 def _operation_name(anchor: type[Operation]) -> str:
@@ -75,6 +83,54 @@ class Pass:
                 continue
             options.append(f"{field.metadata['argument']}={_format_option(value)}")
         return self.ARGUMENT + ("{" + " ".join(options) + "}" if options else "")
+
+
+_PYTHON_PASSES: dict[PythonPass, str] = {}
+"""Every Python pass instance used in a pipeline, and its registered name."""
+
+# MLIR keeps registered passes until the process ends, after Python; let go
+# of their Python callables while Python still runs.
+atexit.register(release_python_passes)
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PythonPass(Pass):
+    """A pass written in Python, usable anywhere in a pipeline: subclass it,
+    implement ``run``, and add fields for options::
+
+        @dataclasses.dataclass(frozen=True, kw_only=True)
+        class CountCalls(PythonPass):
+            \"\"\"Fails if a function calls itself.\"\"\"
+
+            ANCHOR = func.FuncOp          # runs on each function (optional)
+
+            def run(self, op: Operation) -> None:
+                ...                       # inspect or rewrite op
+
+        PassManager(Module, [Nested(func.FuncOp, [CountCalls()]), CSE()])
+
+    ``run`` gets the operation the pass runs on; it may rewrite anything
+    nested in it. Raising an exception fails the pipeline, and the exception
+    is re-raised from ``PassManager.run``. Instances with equal fields are
+    the same pass.
+    """
+
+    ARGUMENT: ClassVar[str] = ""
+
+    def run(self, op: Operation) -> None:
+        """Run the pass on ``op``."""
+        raise NotImplementedError(f"{type(self).__name__} must implement run()")
+
+    def __str__(self) -> str:
+        argument = _PYTHON_PASSES.get(self)
+        if argument is None:
+            name = type(self).__name__
+            snake = "".join(f"-{c.lower()}" if c.isupper() else c for c in name)
+            argument = f"python{snake}-{len(_PYTHON_PASSES)}"
+            summary = (type(self).__doc__ or name).strip().splitlines()[0]
+            register_python_pass(argument, summary, self.run)
+            _PYTHON_PASSES[self] = argument
+        return argument
 
 
 type PipelineElement = Pass | Nested

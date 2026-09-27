@@ -21,6 +21,7 @@
 #include <mlir/ExecutionEngine/ExecutionEngine.h>
 #include <mlir/ExecutionEngine/OptUtils.h>
 #include <mlir/IR/BuiltinTypes.h>
+#include <mlir/Target/Cpp/CppEmitter.h>
 #include <mlir/Target/LLVMIR/Export.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
@@ -344,8 +345,101 @@ nb::object load(const char *bytes, mlir::Type type) {
   return nb::int_(value);
 }
 
+/// The struct format character for a memref element type (see `struct`).
+char bufferFormat(mlir::Type element) {
+  if (llvm::isa<mlir::Float32Type>(element))
+    return 'f';
+  if (llvm::isa<mlir::Float64Type>(element))
+    return 'd';
+  if (llvm::isa<mlir::IndexType>(element))
+    return 'q';
+  auto integer = llvm::cast<mlir::IntegerType>(element);
+  bool isUnsigned = integer.isUnsigned();
+  switch (integer.getWidth()) {
+  case 1:
+    return '?';
+  case 8:
+    return isUnsigned ? 'B' : 'b';
+  case 16:
+    return isUnsigned ? 'H' : 'h';
+  case 32:
+    return isUnsigned ? 'I' : 'i';
+  default:
+    return isUnsigned ? 'Q' : 'q';
+  }
+}
+
+void checkResultMemRef(mlir::MemRefType type, const std::string &what) {
+  mlir::Type element = type.getElementType();
+  auto integer = llvm::dyn_cast<mlir::IntegerType>(element);
+  bool ok = llvm::isa<mlir::Float32Type, mlir::Float64Type, mlir::IndexType>(element) ||
+            (integer && (integer.getWidth() == 1 || integer.getWidth() == 8 ||
+                         integer.getWidth() == 16 || integer.getWidth() == 32 ||
+                         integer.getWidth() == 64));
+  if (!ok || type.getMemorySpace())
+    throw nb::type_error((what + " has type " + typeName(type) +
+                          "; memref results need integer, index, f32, or f64 "
+                          "elements in the default memory space")
+                             .c_str());
+}
+
+/// Size in bytes of a memref's lowered descriptor: two pointers, the offset,
+/// and a size and a stride per dimension.
+size_t descriptorSize(mlir::MemRefType type) { return 8 * (3 + 2 * type.getRank()); }
+
+/// Copies the memref described at `bytes` into a new Python buffer (a
+/// memoryview over a bytearray, shaped like the memref), freeing the memref's
+/// allocation when the caller owns it.
+nb::object loadMemRef(const char *bytes, mlir::MemRefType type, bool owned) {
+  void *allocated, *aligned;
+  int64_t offset;
+  std::memcpy(&allocated, bytes, 8);
+  std::memcpy(&aligned, bytes + 8, 8);
+  std::memcpy(&offset, bytes + 16, 8);
+  int64_t rank = type.getRank();
+  std::vector<int64_t> sizes(rank), strides(rank);
+  for (int64_t d = 0; d < rank; ++d) {
+    std::memcpy(&sizes[d], bytes + 24 + 8 * d, 8);
+    std::memcpy(&strides[d], bytes + 24 + 8 * (rank + d), 8);
+  }
+  char format = bufferFormat(type.getElementType());
+  size_t item = format == '?' ? 1 : storageSize(type.getElementType());
+  int64_t count = 1;
+  for (int64_t size : sizes)
+    count *= size;
+  nb::bytearray copy;
+  copy.resize(static_cast<size_t>(count) * item);
+  char *out = static_cast<char *>(copy.data());
+  const char *base = static_cast<const char *>(aligned) + offset * item;
+  // Walk the elements in row-major order, following the memref's strides.
+  std::vector<int64_t> index(rank, 0);
+  for (int64_t n = 0; n < count; ++n) {
+    int64_t at = 0;
+    for (int64_t d = 0; d < rank; ++d)
+      at += index[d] * strides[d];
+    std::memcpy(out + n * item, base + at * item, item);
+    for (int64_t d = rank - 1; d >= 0; --d) {
+      if (++index[d] < sizes[d])
+        break;
+      index[d] = 0;
+    }
+  }
+  if (owned)
+    std::free(allocated);
+  nb::object view = nb::module_::import_("builtins").attr("memoryview")(copy);
+  // Python cannot shape a view with a zero-length dimension; an empty
+  // memref comes back as an empty one-dimensional view.
+  if (count == 0)
+    return view.attr("cast")(std::string(1, format));
+  nb::list shape;
+  for (int64_t size : sizes)
+    shape.append(size);
+  return view.attr("cast")(std::string(1, format), nb::tuple(shape));
+}
+
 nb::object call(PyExecutionEngine &self, const std::string &name,
-                const PyFunctionType &signature, const std::vector<nb::object> &args) {
+                const PyFunctionType &signature, const std::vector<nb::object> &args,
+                bool ownedResults) {
   auto type = llvm::cast<mlir::FunctionType>(signature.type);
   if (args.size() != type.getNumInputs())
     throw nb::type_error((name + "() takes " + std::to_string(type.getNumInputs()) +
@@ -393,9 +487,16 @@ nb::object call(PyExecutionEngine &self, const std::string &name,
   std::vector<size_t> offsets;
   size_t resultBytes = 0;
   for (unsigned i = 0; i < type.getNumResults(); ++i) {
-    checkScalar(type.getResult(i), "result " + std::to_string(i));
-    size_t size = storageSize(type.getResult(i));
-    resultBytes = llvm::alignTo(resultBytes, size);
+    size_t size, alignment;
+    if (auto memref = llvm::dyn_cast<mlir::MemRefType>(type.getResult(i))) {
+      checkResultMemRef(memref, "result " + std::to_string(i));
+      size = descriptorSize(memref);
+      alignment = 8;
+    } else {
+      checkScalar(type.getResult(i), "result " + std::to_string(i));
+      size = alignment = storageSize(type.getResult(i));
+    }
+    resultBytes = llvm::alignTo(resultBytes, alignment);
     offsets.push_back(resultBytes);
     resultBytes += size;
   }
@@ -409,13 +510,18 @@ nb::object call(PyExecutionEngine &self, const std::string &name,
   if (error)
     throw MLIRError("calling '" + name + "' failed: " + errorText(std::move(error)));
   const char *bytes = reinterpret_cast<const char *>(resultStorage.data());
+  auto result = [&](unsigned i) -> nb::object {
+    if (auto memref = llvm::dyn_cast<mlir::MemRefType>(type.getResult(i)))
+      return loadMemRef(bytes + offsets[i], memref, ownedResults);
+    return load(bytes + offsets[i], type.getResult(i));
+  };
   if (type.getNumResults() == 0)
     return nb::none();
   if (type.getNumResults() == 1)
-    return load(bytes, type.getResult(0));
+    return result(0);
   nb::list results;
   for (unsigned i = 0; i < type.getNumResults(); ++i)
-    results.append(load(bytes + offsets[i], type.getResult(i)));
+    results.append(result(i));
   return nb::tuple(results);
 }
 
@@ -518,6 +624,27 @@ void bindCodegen(nb::module_ &m) {
         "Raises:\n"
         "    MLIRError: If the module still contains non-LLVM operations.");
 
+  m.def(
+      "translate_to_cpp",
+      [](const PyOperation &op, bool declareVariablesAtTop) {
+        mlir::Operation *native = get(op);
+        DiagnosticCapture capture(native->getContext());
+        std::string text;
+        llvm::raw_string_ostream out(text);
+        if (mlir::failed(
+                mlir::emitc::translateToCpp(native, out, declareVariablesAtTop)))
+          capture.raise("translation to C/C++ failed; lower the module to the "
+                        "EmitC dialect first (see codegen.lower_to_emitc)");
+        return text;
+      },
+      "module"_a, nb::kw_only(), "declare_variables_at_top"_a = false,
+      "Translate an MLIR module in the EmitC dialect to C or C++ source.\n\n"
+      "With ``declare_variables_at_top``, each function declares all its\n"
+      "variables before its first statement (needed for C89 and for\n"
+      "functions with more than one block).\n\n"
+      "Raises:\n"
+      "    MLIRError: If the module contains operations EmitC cannot print.");
+
   nb::class_<PyExecutionEngine>(
       m, "ExecutionEngine",
       "JIT-compiles an MLIR module in the LLVM dialect into this process.\n\n"
@@ -554,15 +681,20 @@ void bindCodegen(nb::module_ &m) {
            "    shared_libraries: Paths of shared libraries to load for external\n"
            "        symbols (``codegen.compile`` also takes names and archives).\n\n"
            "Raises:\n    MLIRError: If translation or compilation fails.")
-      .def("call", &call, "name"_a, "signature"_a, "args"_a,
+      .def("call", &call, "name"_a, "signature"_a, "args"_a, nb::kw_only(),
+           "owned_results"_a = false,
            nb::sig("def call(self, name: str, signature: FunctionType, "
                    "args: collections.abc.Sequence[int | float | bool | "
-                   "collections.abc.Buffer], /) -> "
-                   "int | float | bool | tuple[int | float | bool, ...] | None"),
+                   "collections.abc.Buffer], /, *, owned_results: bool = False) -> "
+                   "int | float | bool | memoryview | "
+                   "tuple[int | float | bool | memoryview, ...] | None"),
            "Low level: call function ``name`` of type ``signature`` with\n"
            "``args``: Python numbers for scalars, writable buffers (such as\n"
            "NumPy arrays) for memrefs, which the function reads and writes in\n"
-           "place. Returns ``None``, one value, or a tuple of values.\n\n"
+           "place. Returns ``None``, one value, or a tuple of values; a memref\n"
+           "result is copied into a new ``memoryview`` shaped like it. With\n"
+           "``owned_results``, memref results are buffers the function\n"
+           "allocated for the caller, freed once copied.\n\n"
            "Raises:\n"
            "    TypeError: For a wrong argument count, argument types, or\n"
            "        types that cannot cross the Python boundary.\n"

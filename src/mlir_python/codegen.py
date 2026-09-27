@@ -19,6 +19,11 @@ Each stage is also available on its own: ``llvm_lowering_pipeline`` /
 ``lower_to_llvm``, ``to_llvm_ir`` / ``translate_to_llvm_ir`` (returning an
 ``LLVMModule`` to verify, optimize, or emit as an object file or assembly),
 and ``ExecutionEngine``.
+
+Modules can also become C or C++ source, through the EmitC dialect, for
+toolchains MLIR does not target::
+
+    source = codegen.to_c(module)                       # or to_cpp(module)
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ import ctypes.util
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections.abc import Buffer, Sequence
 from pathlib import Path
@@ -36,14 +42,21 @@ from . import passes
 from ._mlir_python import (
     ExecutionEngine,
     FunctionType,
+    InsertionPoint,
     IntegerType,
     LLVMModule,
+    Location,
+    MemRefType,
     Module,
+    Operation,
     OptLevel,
+    Value,
+    WalkResult,
+    translate_to_cpp,
     translate_to_llvm_ir,
 )
-from ._passes import PassManager, PipelineElement
-from .dialects import func, llvm
+from ._passes import Nested, PassManager, PipelineElement
+from .dialects import emitc, func, llvm
 
 __all__ = [
     "Argument",
@@ -56,13 +69,19 @@ __all__ = [
     "OptLevel",
     "Result",
     "Scalar",
+    "async_runtime",
     "build_executable",
     "build_shared_library",
     "compile",
+    "emitc_lowering_pipeline",
     "llvm_lowering_pipeline",
     "load_libraries",
+    "lower_to_emitc",
     "lower_to_llvm",
+    "to_c",
+    "to_cpp",
     "to_llvm_ir",
+    "translate_to_cpp",
     "translate_to_llvm_ir",
 ]
 
@@ -76,8 +95,10 @@ writable buffer (a NumPy array, ``array.array``, ``memoryview``, ...) with the
 memref's element type, rank, and static sizes. The function reads and writes
 the buffer in place."""
 
-type Result = Scalar | tuple[Scalar, ...] | None
-"""What a compiled function returns: nothing, one value, or a tuple."""
+type Result = Scalar | memoryview | tuple[Scalar | memoryview, ...] | None
+"""What a compiled function returns: nothing, one value, or a tuple. A memref
+result arrives as a ``memoryview`` (a copy, shaped like the memref; pass it
+to ``numpy.asarray`` or call ``tolist()``)."""
 
 type Library = str | os.PathLike[str]
 """A library providing external functions, in one of two forms:
@@ -90,6 +111,70 @@ type Library = str | os.PathLike[str]
 A path written as a ``str`` is rejected, since it would be searched for as a
 name; wrap it in ``Path``.
 """
+
+
+def async_runtime() -> Path:
+    """The async runtime bundled with mlir_python: MLIR's reference
+    implementation (a thread pool) of the C API that compiled ``async`` code
+    calls (``mlirAsyncRuntimeCreateToken``, ``mlirAsyncRuntimeExecute``, ...;
+    see mlir/ExecutionEngine/AsyncRuntime.h).
+
+    Code using ``async`` gets it by default; pass ``async_runtime=`` to
+    ``compile``, ``build_executable``, or ``build_shared_library`` to use
+    another implementation of the same functions (for example one that runs
+    coroutines on an event loop).
+    """
+    suffix = ".dylib" if sys.platform == "darwin" else ".so"
+    return Path(__file__).resolve().parent / f"libmlir_async_runtime{suffix}"
+
+
+def _uses_async(module: Module) -> bool:
+    """Whether ``module`` contains operations of the async dialect."""
+    found = False
+
+    def visit(op: Operation) -> WalkResult | None:
+        nonlocal found
+        if op.name.startswith("async."):
+            found = True
+            return WalkResult.INTERRUPT
+        return None
+
+    module.walk(visit)
+    return found
+
+
+def _runtime_for(module: Module, runtime: Library | None) -> Path | None:
+    """The async runtime ``module`` needs, if any: ``runtime``, or the
+    bundled one."""
+    if not _uses_async(module):
+        return None
+    chosen = _library(runtime) if runtime is not None else async_runtime()
+    if isinstance(chosen, str):
+        raise TypeError("async_runtime must be a Path to a shared library")
+    return chosen
+
+
+_ASYNC_RUNTIME: list[Path] = []
+"""The async runtime loaded into this process for JIT-compiled code."""
+
+
+def _load_async_runtime(runtime: Path) -> None:
+    """Loads ``runtime`` into the process for JIT-compiled async code.
+
+    The runtime keeps process-wide state (MLIR's keeps a thread pool), so
+    each process uses one: loading another one later would leave compiled
+    code calling whichever was loaded first.
+    """
+    if _ASYNC_RUNTIME:
+        if _ASYNC_RUNTIME[0] != runtime:
+            raise ValueError(
+                f"this process already runs JIT-compiled async code on {_ASYNC_RUNTIME[0]}; "
+                "the async runtime is process-wide, so choose it before the first "
+                "async compile (executables can each link their own)"
+            )
+        return
+    load_libraries([runtime])
+    _ASYNC_RUNTIME.append(runtime)
 
 
 def _library(library: Library) -> str | Path:
@@ -212,11 +297,24 @@ def _load_archive(archive: Path, linker: str | None) -> ctypes.CDLL:
 def llvm_lowering_pipeline() -> list[PipelineElement]:
     """The passes ``lower_to_llvm`` runs, to inspect or extend.
 
-    Structured control flow becomes branches, every dialect with an LLVM
-    lowering is converted, and leftover conversion casts are removed.
+    ``async`` operations become LLVM coroutines calling the async runtime
+    (see ``async_runtime``), leftover bufferization operations (buffer
+    clones) become memref operations, vector reductions over several
+    dimensions become one-dimensional ones, multi-dimensional vector
+    transfers become loops, structured control flow becomes branches, the remaining
+    vector operations become LLVM vector code, every other dialect with an
+    LLVM lowering is converted, and leftover conversion casts are removed.
     """
     return [
+        Nested(func.FuncOp, [passes.LowerVectorMultiReduction()]),
+        passes.ConvertVectorToSCF(),
+        passes.AsyncToAsyncRuntime(),
+        passes.AsyncRuntimeRefCounting(),
+        passes.AsyncRuntimeRefCountingOpt(),
+        passes.ConvertAsyncToLLVM(),
+        passes.ConvertBufferizationToMemRef(),
         passes.SCFToControlFlow(),
+        passes.ConvertVectorToLLVM(),
         passes.ConvertToLLVM(),
         passes.ReconcileUnrealizedCasts(),
     ]
@@ -234,6 +332,97 @@ def lower_to_llvm(module: Module) -> None:
     PassManager(Module, llvm_lowering_pipeline()).run(module)
 
 
+def emitc_lowering_pipeline(*, cpp: bool = False) -> list[PipelineElement]:
+    """The passes ``lower_to_emitc`` runs, to inspect or extend.
+
+    Branches are lifted back into structured control flow, math functions
+    become calls into the C (or, with ``cpp``, C++) standard library, the
+    func, arith, scf, and memref dialects are converted (memrefs with static
+    shapes become arrays, with the standard headers they need included),
+    and each value computed once is folded into the expression using it.
+    ``lower_to_emitc`` then includes the headers defining the types used
+    (``int32_t``, ``size_t``, ``bool``).
+    """
+    return [
+        passes.LiftControlFlowToSCF(),
+        passes.Canonicalizer(),
+        passes.ConvertMathToEmitCLibm(lower_to_cpp=cpp),
+        passes.ConvertToEmitC(),
+        passes.ConvertMemRefToEmitC(lower_to_cpp=cpp),
+        passes.ReconcileUnrealizedCasts(),
+        passes.FormExpressions(),
+    ]
+
+
+def lower_to_emitc(module: Module, *, cpp: bool = False) -> None:
+    """Lower ``module`` to the EmitC dialect in place, ready for
+    ``translate_to_cpp``.
+
+    Handles into the module's contents become stale; the module itself stays
+    usable.
+
+    Raises:
+        ValueError: If a memref has a dynamic shape (C arrays need static
+            sizes).
+        MLIRError: If some operation has no lowering to EmitC.
+    """
+
+    def check(op: Operation) -> None:
+        values: list[Value] = [*op.results]
+        for region in op.regions:
+            for block in region.blocks:
+                values.extend(block.arguments)
+        for value in values:
+            kind = value.type
+            if isinstance(kind, MemRefType) and not kind.has_static_shape:
+                raise ValueError(
+                    f"{op.name} uses {kind}, but only memrefs with static shapes "
+                    "can become C arrays"
+                )
+
+    module.walk(check)
+    PassManager(Module, emitc_lowering_pipeline(cpp=cpp)).run(module)
+    headers = ("cstddef", "cstdint") if cpp else ("stdbool.h", "stddef.h", "stdint.h")
+    body = module.body
+    present = {op.include for op in body.operations if isinstance(op, emitc.IncludeOp)}
+    with InsertionPoint.at_block_begin(body), Location.unknown(context=module.context):
+        for header in headers:
+            if header not in present:
+                emitc.IncludeOp(header, is_standard_include=True)
+
+
+def to_c(module: Module) -> str:
+    """C99 source for ``module`` (in the func, arith, math, scf, cf, and
+    memref dialects), lowered from a copy.
+
+    Every function becomes a C function with the same name; memrefs must
+    have static shapes. Compile the result with any C compiler.
+
+    Raises:
+        ValueError: If a memref has a dynamic shape.
+        MLIRError: If some operation cannot be expressed in C.
+    """
+    return _to_source(module, cpp=False)
+
+
+def to_cpp(module: Module) -> str:
+    """C++11 source for ``module``, like ``to_c`` but calling the C++
+    standard library (``std::sqrt`` for ``math.sqrt``, ...).
+
+    Raises:
+        ValueError: If a memref has a dynamic shape.
+        MLIRError: If some operation cannot be expressed in C++.
+    """
+    return _to_source(module, cpp=True)
+
+
+def _to_source(module: Module, *, cpp: bool) -> str:
+    copy = module.clone()
+    assert isinstance(copy, Module)
+    lower_to_emitc(copy, cpp=cpp)
+    return translate_to_cpp(copy)
+
+
 class CompiledFunction:
     """A JIT-compiled function, called like a Python function.
 
@@ -241,12 +430,22 @@ class CompiledFunction:
     ``Argument`` and ``Result`` for what can cross the boundary.
     """
 
-    def __init__(self, engine: ExecutionEngine, name: str, type: FunctionType) -> None:
+    def __init__(
+        self,
+        engine: ExecutionEngine,
+        name: str,
+        type: FunctionType,
+        *,
+        owned_results: bool = False,
+    ) -> None:
         self._engine = engine
         self.name = name
         """The function's symbol name."""
         self.type = type
         """The function's MLIR signature."""
+        self.owned_results = owned_results
+        """Whether memref results are buffers allocated for the caller (as
+        after ``pipelines.buffer_deallocation``), freed once copied."""
 
     def __call__(self, *args: Argument) -> Result:
         """Call the function.
@@ -259,7 +458,9 @@ class CompiledFunction:
                 buffer whose element type, shape, or strides do not match.
             OverflowError: If an int does not fit its integer type.
         """
-        result: Result = self._engine.call(self.name, self.type, list(args))
+        result: Result = self._engine.call(
+            self.name, self.type, list(args), owned_results=self.owned_results
+        )
         return result
 
     def __repr__(self) -> str:
@@ -289,9 +490,12 @@ class CompiledModule:
         """Names of the callable functions, in module order."""
         return list(self._signatures)
 
-    def function(self, fn: func.FuncOp) -> CompiledFunction:
+    def function(
+        self, fn: func.FuncOp, *, owned_results: bool = False
+    ) -> CompiledFunction:
         """The compiled version of ``fn``, a function of the module that was
-        compiled.
+        compiled. With ``owned_results``, its memref results are buffers it
+        allocated for the caller (see ``CompiledFunction.owned_results``).
 
         Raises:
             ValueError: If ``fn`` was not compiled here, or its signature
@@ -308,7 +512,9 @@ class CompiledModule:
                 f"@{name} changed type since it was compiled "
                 f"({signature} -> {fn.function_type}); compile again"
             )
-        return CompiledFunction(self.engine, name, signature)
+        return CompiledFunction(
+            self.engine, name, signature, owned_results=owned_results
+        )
 
 
 def compile(
@@ -317,6 +523,7 @@ def compile(
     opt_level: OptLevel = OptLevel.O2,
     libraries: Sequence[Library] = (),
     linker: str | None = None,
+    async_runtime: Library | None = None,
 ) -> CompiledModule:
     """Lower, translate, and JIT-compile a copy of ``module``.
 
@@ -331,12 +538,21 @@ def compile(
             ``load_libraries``. Functions already in this process (the C
             library, for one) need none.
         linker: C compiler driver used to load static archives.
+        async_runtime: A shared library implementing the async runtime API,
+            used when the module has ``async`` operations; the bundled one
+            (``codegen.async_runtime()``) by default. JIT-compiled code in
+            one process shares one runtime, loaded on first use.
 
     Raises:
         ValueError, FileNotFoundError, LinkError: See ``load_libraries``.
+        ValueError: If ``async_runtime`` differs from the runtime this process
+            already uses.
         MLIRError: If lowering, LLVM IR verification, or compilation fails.
     """
     load_libraries(libraries, linker=linker)
+    runtime = _runtime_for(module, async_runtime)
+    if runtime is not None:
+        _load_async_runtime(runtime)
     signatures = {
         op.sym_name: op.function_type
         for op in module.body.operations
@@ -391,8 +607,12 @@ def _link(
     opt_level: OptLevel,
     libraries: Sequence[Library],
     linker: str | None,
+    async_runtime: Library | None = None,
 ) -> Path:
     resolved = [_library(library) for library in libraries]
+    runtime = _runtime_for(module, async_runtime)
+    if runtime is not None:
+        resolved.append(runtime)
     llvm_ir = to_llvm_ir(module, opt_level=opt_level)
     driver = _find_linker(linker)
     target = Path(output).resolve()
@@ -411,6 +631,15 @@ def _link(
             f"-l{library}" if isinstance(library, str) else str(library)
             for library in resolved
         ]
+        # Shared libraries given by path are found at run time where they
+        # were at link time.
+        command += sorted(
+            {
+                f"-Wl,-rpath,{library.parent}"
+                for library in resolved
+                if isinstance(library, Path) and not _is_archive(library)
+            }
+        )
         result = subprocess.run(command, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise LinkError(
@@ -451,6 +680,7 @@ def build_executable(
     opt_level: OptLevel = OptLevel.O2,
     libraries: Sequence[Library] = (),
     linker: str | None = None,
+    async_runtime: Library | None = None,
 ) -> Path:
     """Compile ``module`` into a native executable for this machine.
 
@@ -466,6 +696,9 @@ def build_executable(
             ``-lm``) or paths to ``.so``/``.a`` files; see ``Library``.
         linker: C compiler driver used to link; ``$CC``, ``cc``, ``clang``,
             or ``gcc`` by default.
+        async_runtime: The async runtime library to link when the module has
+            ``async`` operations (see ``async_runtime``); the bundled one by
+            default.
 
     Returns:
         The absolute path of the executable.
@@ -485,6 +718,7 @@ def build_executable(
         opt_level=opt_level,
         libraries=libraries,
         linker=linker,
+        async_runtime=async_runtime,
     )
 
 
@@ -495,6 +729,7 @@ def build_shared_library(
     opt_level: OptLevel = OptLevel.O2,
     libraries: Sequence[Library] = (),
     linker: str | None = None,
+    async_runtime: Library | None = None,
 ) -> Path:
     """Compile ``module`` into a native shared library for this machine.
 
@@ -509,6 +744,9 @@ def build_shared_library(
             ``-lm``) or paths to ``.so``/``.a`` files; see ``Library``.
         linker: C compiler driver used to link; ``$CC``, ``cc``, ``clang``,
             or ``gcc`` by default.
+        async_runtime: The async runtime library to link when the module has
+            ``async`` operations (see ``async_runtime``); the bundled one by
+            default.
 
     Returns:
         The absolute path of the library.
@@ -526,4 +764,5 @@ def build_shared_library(
         opt_level=opt_level,
         libraries=libraries,
         linker=linker,
+        async_runtime=async_runtime,
     )

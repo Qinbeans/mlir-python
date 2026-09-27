@@ -7,13 +7,14 @@
 # runtime they are `ScalarType` objects that the compiler reads from
 # annotations (see types.py).
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal, TypeAlias, dataclass_transform
 
 from .._mlir_python import Type
 
-type Kind = Literal["int", "uint", "float", "bool", "ptr", "cstr", "struct", "fn"]
+type Kind = Literal[
+    "int", "uint", "float", "bool", "ptr", "cstr", "struct", "array", "fn"
+]
 
 @dataclass(frozen=True)
 class ScalarType:
@@ -44,10 +45,6 @@ class FnType(ScalarType):
     params: tuple[ScalarType, ...] = ()
     result: ScalarType | None = None
 
-Fn: TypeAlias = Callable
-"""``Fn[[P1, P2], R]``: a function value (a C function pointer); to type
-checkers, ``Callable[[P1, P2], R]``."""
-
 i8: TypeAlias = int
 i16: TypeAlias = int
 i32: TypeAlias = int
@@ -61,14 +58,42 @@ f64: TypeAlias = float
 cstr: TypeAlias = str
 
 class ptr:
-    """An opaque pointer, as returned by C functions such as ``malloc``."""
+    """An opaque pointer, as returned by C functions such as ``malloc``.
+    ``ptr(xs)`` is the address of an array's first item, to pass to C."""
+
+    def __init__(self, address: ptr | list[Any], /) -> None: ...
+
+type Array[T] = list[T]
+"""``Array[T]``: an array of ``T`` values (``Array[i32]``), created with a
+list display (``[1, 2, 3]``) or ``array(i32, n)``. Index it like a list
+(``xs[i]``, ``xs[-1]``, ``xs[i] = v``; out-of-range indices stop the
+program), take ``len(xs)``, iterate it, and pass and return it; it is freed
+automatically. To type checkers it is ``list[T]``, so Python lists pass in
+and come back out (buffers such as NumPy arrays are also accepted at runtime,
+without copying). Pass it to C as ``ptr(xs)`` or ``Ptr[T](xs)``."""
+
+def array[T](kind: type[T], length: int, /) -> list[T]:
+    """A new array of ``length`` zeros of type ``kind``: ``array(f64, n)``."""
+
+@dataclass(frozen=True)
+class ArrayType(ScalarType):
+    def mlir(self) -> Type: ...
+
+class Fn[**P, R](ptr):
+    """``Fn[[P1, P2], R]``: a function value (a C function pointer), e.g. a
+    compiled or extern function passed as an argument. Call it like a
+    function; ``Fn[[P1], R](raw)`` types an opaque ``ptr``. Any ``Fn`` passes
+    where a ``ptr`` is expected."""
+
+    def __init__(self, address: ptr, /) -> None: ...
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R: ...
 
 class Ptr[T](ptr):
     """A pointer to ``T`` values, e.g. ``Ptr[i32]``. Index it to read and
     write (``p[0]``, ``p[i] = x``); ``Ptr[T](raw)`` types an opaque ``ptr``.
     Any ``Ptr[T]`` passes where a ``ptr`` is expected."""
 
-    def __init__(self, address: ptr | Ptr[Any]) -> None: ...
+    def __init__(self, address: ptr | Ptr[Any] | list[T], /) -> None: ...
     def __getitem__(self, index: int) -> T: ...
     def __setitem__(self, index: int, value: T) -> None: ...
 

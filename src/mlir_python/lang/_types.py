@@ -20,10 +20,12 @@ import inspect
 from dataclasses import dataclass
 from typing import Literal
 
-from .._mlir_python import F32Type, F64Type, IntegerType, Type
+from .._mlir_python import F32Type, F64Type, IntegerType, MemRefType, Type
 from ..dialects import llvm
 
-type Kind = Literal["int", "uint", "float", "bool", "ptr", "cstr", "struct", "fn"]
+type Kind = Literal[
+    "int", "uint", "float", "bool", "ptr", "cstr", "struct", "array", "fn"
+]
 
 
 @dataclass(frozen=True)
@@ -120,6 +122,54 @@ class Ptr:
 def pointer_to(element: ScalarType) -> ScalarType:
     """The type ``Ptr[element]``."""
     return ScalarType(f"Ptr[{element.name}]", "ptr", 64, element)
+
+
+@dataclass(frozen=True, repr=False)
+class ArrayType(ScalarType):
+    """``Array[T]``: a heap array of ``T`` values with a length, like a
+    Python list of fixed size. Compiled as a one-dimensional ``memref``;
+    freed automatically once nothing uses it."""
+
+    def mlir(self) -> Type:
+        assert self.element is not None
+        return MemRefType([None], self.element.mlir())
+
+    def __call__(self, value: object) -> object:
+        raise TypeError(f"create a {self.name} with [...] or array(T, length)")
+
+
+ARRAY_ELEMENT_KINDS = ("int", "uint", "float", "bool")
+
+
+class Array:
+    """``Array[T]``: an array of ``T`` values (``Array[i32]``), created with
+    a list display (``[1, 2, 3]``) or ``array(i32, n)``. Index it like a
+    list (``xs[i]``, ``xs[-1]``, ``xs[i] = v``; out-of-range indices stop the
+    program), take ``len(xs)``, iterate it (``for x in xs``), and pass and
+    return it. From Python, pass a list (or a buffer such as a NumPy array),
+    and get a list back. To type checkers it is ``list[T]``."""
+
+    def __class_getitem__(cls, element: object) -> ScalarType:
+        kind = scalar_type(element)
+        if kind is None or kind.kind not in ARRAY_ELEMENT_KINDS:
+            raise TypeError(
+                f"Array[...] holds integers, floats, or bools, got {element!r}"
+            )
+        return array_of(kind)
+
+
+def array_of(element: ScalarType) -> ArrayType:
+    """The type ``Array[element]``."""
+    return ArrayType(f"Array[{element.name}]", "array", 64, element)
+
+
+def array(kind: object, length: int) -> list[object]:
+    """``array(T, length)``: a new array of ``length`` zeros of type ``T``
+    (in plain Python, a list of zeros)."""
+    element = scalar_type(kind)
+    if element is None or element.kind not in ARRAY_ELEMENT_KINDS:
+        raise TypeError(f"array() holds integers, floats, or bools, got {kind!r}")
+    return [element(0)] * length
 
 
 def stack(kind: object, count: int = 1) -> object:
@@ -279,6 +329,12 @@ def struct[T](cls: type[T]) -> type[T]:
                 f"field '{name}' of {cls.__name__} has type {annotation!r}; "
                 "use a type such as i32, f32, ptr, or another @struct"
             )
+        if kind.kind == "array":
+            raise TypeError(
+                f"field '{name}' of {cls.__name__} is an array; arrays cannot be "
+                "stored in structs yet (their memory is freed automatically, which "
+                "a struct field cannot track)"
+            )
         fields.append((name, kind))
     declared = dataclasses.dataclass(cls)
     kind = StructType(cls.__name__, "struct", 0, None, tuple(fields), declared)
@@ -288,11 +344,14 @@ def struct[T](cls: type[T]) -> type[T]:
 
 
 __all__ = [
+    "Array",
+    "ArrayType",
     "Fn",
     "FnType",
     "Ptr",
     "ScalarType",
     "StructType",
+    "array",
     "cstr",
     "f32",
     "f64",

@@ -18,7 +18,8 @@ from collections.abc import Sequence
 from typing import ClassVar
 
 from ._mlir_python import Module, Operation
-from ._passes import Nested, Pass, PassManager, PipelineElement
+from ._passes import Nested, Pass, PassManager, PipelineElement, PythonPass
+from .dialects import func
 
 
 class GreedySimplifyRegionLevel(enum.Enum):
@@ -34,6 +35,68 @@ class GreedySimplifyRegionLevel(enum.Enum):
     """Perform aggressive control-flow simplification (e.g. block merging)."""
 
 
+class LanguageTarget(enum.Enum):
+    """Values of the option: Select the language standard target for callees (c99 or cpp11)."""
+
+    C99 = "c99"
+    """c99"""
+
+    CPP11 = "cpp11"
+    """cpp11"""
+
+
+class LayoutMapOption(enum.Enum):
+    """Values of the option: Controls layout maps when bufferizing function signatures."""
+
+    INFER_LAYOUT_MAP = "infer-layout-map"
+
+    IDENTITY_LAYOUT_MAP = "identity-layout-map"
+
+    FULLY_DYNAMIC_LAYOUT_MAP = "fully-dynamic-layout-map"
+
+
+class VectorContractLowering(enum.Enum):
+    """Values of the option: control the lowering of `vector.contract` operations."""
+
+    DOT = "dot"
+    """Progressively lower to finer grained `vector.contract` and dot-products. (default)"""
+
+    LLVMINTR = "llvmintr"
+    """Lower directly to `llvm.intr.matrix.multiply`."""
+
+    OUTERPRODUCT = "outerproduct"
+    """Lower to `vector.outerproduct`."""
+
+    PARALLELARITH = "parallelarith"
+    """Lower contract with all reduction dimensions unrolled to 1 to a vector elementwise operations."""
+
+
+class VectorMultiReductionLowering(enum.Enum):
+    """Values of the option: Select the strategy to control how multi_reduction is lowered."""
+
+    INNER_PARALLEL = "inner-parallel"
+    """Lower multi_reduction into outer-reduction and inner-parallel ops."""
+
+    INNER_REDUCTION = "inner-reduction"
+    """Lower multi_reduction into outer-parallel and inner-reduction ops."""
+
+
+class VectorTransposeLowering(enum.Enum):
+    """Values of the option: control the lowering of `vector.transpose` operations."""
+
+    ELTWISE = "eltwise"
+    """Lower transpose into element-wise extract and inserts (default)"""
+
+    LLVMINTR = "llvmintr"
+    """Lower 2-D transpose directly to `llvm.intr.matrix.transpose`"""
+
+    SHUFFLE1D = "shuffle1d"
+    """Lower 2-D transpose to `vector.shuffle` on 1-D vector."""
+
+    SHUFFLE16X16 = "shuffle16x16"
+    """Lower 2-D transpose to `vector.shuffle` on 16x16 vector."""
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class ArithToLLVMConversion(Pass):
     """``convert-arith-to-llvm``: Convert Arith dialect to LLVM dialect
@@ -47,6 +110,100 @@ class ArithToLLVMConversion(Pass):
         default=0, metadata={"argument": "index-bitwidth"}
     )
     """Bitwidth of the index type, 0 to use size of machine word"""
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class AsyncFuncToAsyncRuntime(Pass):
+    """``async-func-to-async-runtime``: Lower async.func operations to the explicit async.runtime andasync.coro operations"""
+
+    ARGUMENT: ClassVar[str] = "async-func-to-async-runtime"
+    ANCHOR: ClassVar[type[Operation] | None] = Module
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class AsyncParallelFor(Pass):
+    """``async-parallel-for``: Convert scf.parallel operations to multiple async compute ops executed concurrently for non-overlapping iteration ranges"""
+
+    ARGUMENT: ClassVar[str] = "async-parallel-for"
+    ANCHOR: ClassVar[type[Operation] | None] = Module
+
+    async_dispatch: bool = dataclasses.field(
+        default=True, metadata={"argument": "async-dispatch"}
+    )
+    """Dispatch async compute tasks using recursive work splitting. If `false` async compute tasks will be launched using simple for loop in the caller thread."""
+
+    num_workers: int = dataclasses.field(
+        default=8, metadata={"argument": "num-workers"}
+    )
+    """The number of available workers to execute async operations. If `-1` the value will be retrieved from the runtime."""
+
+    min_task_size: int = dataclasses.field(
+        default=1000, metadata={"argument": "min-task-size"}
+    )
+    """The minimum task size for sharding parallel operation."""
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class AsyncRuntimePolicyBasedRefCounting(Pass):
+    """``async-runtime-policy-based-ref-counting``: Policy based reference counting for Async runtime operations
+
+    This pass works at the async runtime abtraction level, after all
+    `async.execute` and `async.await` operations are lowered to the async
+    runtime API calls, and async coroutine operations.
+
+    This pass doesn't rely on reference counted values liveness analysis, and
+    instead uses simple policy to create reference counting operations. If the
+    program violates any of the assumptions, then this pass might lead to
+    memory leaks or runtime errors.
+
+    The default reference counting policy assumptions:
+      1. Async token can be awaited or added to the group only once.
+      2. Async value or group can be awaited only once.
+
+    Under these assumptions reference counting only needs to drop reference:
+      1. After `async.runtime.await` operation for async tokens and groups
+         (until error handling is not implemented for the sync await).
+      2. After `async.runtime.is_error` operation for async tokens and groups
+         (this is the last operation in the coroutine resume function).
+      3. After `async.runtime.load` operation for async values.
+
+    This pass introduces significanly less runtime overhead compared to the
+    automatic reference counting.
+    """
+
+    ARGUMENT: ClassVar[str] = "async-runtime-policy-based-ref-counting"
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class AsyncRuntimeRefCounting(Pass):
+    """``async-runtime-ref-counting``: Automatic reference counting for Async runtime operations
+
+    This pass works at the async runtime abtraction level, after all
+    `async.execute` and `async.await` operations are lowered to the async
+    runtime API calls, and async coroutine operations.
+
+    It relies on the LLVM coroutines switched-resume lowering semantics for
+    the correct placing of the reference counting operations.
+
+    See: https://llvm.org/docs/Coroutines.html#switched-resume-lowering
+    """
+
+    ARGUMENT: ClassVar[str] = "async-runtime-ref-counting"
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class AsyncRuntimeRefCountingOpt(Pass):
+    """``async-runtime-ref-counting-opt``: Optimize automatic reference counting operations for theAsync runtime by removing redundant operations"""
+
+    ARGUMENT: ClassVar[str] = "async-runtime-ref-counting-opt"
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class AsyncToAsyncRuntime(Pass):
+    """``async-to-async-runtime``: Lower all high level async operations (e.g. async.execute) tothe explicit async.runtime and async.coro operations"""
+
+    ARGUMENT: ClassVar[str] = "async-to-async-runtime"
+    ANCHOR: ClassVar[type[Operation] | None] = Module
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -93,6 +250,96 @@ class BubbleDownMemorySpaceCasts(Pass):
     """
 
     ARGUMENT: ClassVar[str] = "bubble-down-memory-space-casts"
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class BufferDeallocationSimplification(Pass):
+    """``buffer-deallocation-simplification``: Optimizes `bufferization.dealloc` operation for more efficient codegen
+
+    This pass uses static alias analysis to reduce the number of alias checks
+    required at runtime. Such checks are sometimes necessary to make sure that
+    memrefs aren't deallocated before their last usage (use after free) or that
+    some memref isn't deallocated twice (double free).
+    """
+
+    ARGUMENT: ClassVar[str] = "buffer-deallocation-simplification"
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class BufferHoisting(Pass):
+    """``buffer-hoisting``: Optimizes placement of allocation operations by moving them into common dominators and out of nested regions
+
+    This pass implements an approach to aggressively move allocations upwards
+    into common dominators and out of nested regions.
+    """
+
+    ARGUMENT: ClassVar[str] = "buffer-hoisting"
+    ANCHOR: ClassVar[type[Operation] | None] = func.FuncOp
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class BufferLoopHoisting(Pass):
+    """``buffer-loop-hoisting``: Optimizes placement of allocation operations by moving them out of loop nests
+
+    This pass implements an approach to aggressively move allocations upwards
+    out of loop nests. It does not move allocations into common dominators.
+    """
+
+    ARGUMENT: ClassVar[str] = "buffer-loop-hoisting"
+    ANCHOR: ClassVar[type[Operation] | None] = func.FuncOp
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class BufferResultsToOutParams(Pass):
+    """``buffer-results-to-out-params``: Converts memref-typed function results to out-params
+
+    Some calling conventions prefer to pass output memrefs as "out params". The
+    conversion to this calling convention must be done as an atomic
+    transformation of the entire program (hence this is a module pass).
+
+    For example, if a call is rewritten, the callee needs to be rewritten
+    otherwise the IR will end up invalid. Thus, this transformation
+    require an atomic change to the entire program (e.g. the whole module).
+
+    This pass is expected to run immediately after bufferization is finished.
+    At that point, tensor-typed results will have been converted to memref-typed
+    results, and can be consistently converted to out params.
+
+    All memref-typed results are appended to the function argument list.
+
+    The main issue with this pass (and the out-param calling convention) is that
+    buffers for results need to be allocated in the caller. This currently only
+    works for static shaped memrefs.
+
+    If the hoist-static-allocs option is on, the pass tries to eliminate the
+    allocation for the returned memref and avoid the memory-copy if possible.
+    This optimization applies on the returned memref which has static shape and
+    is allocated by memref.alloc in the function. It will use the memref given
+    in function argument to replace the allocated memref.
+    """
+
+    ARGUMENT: ClassVar[str] = "buffer-results-to-out-params"
+    ANCHOR: ClassVar[type[Operation] | None] = Module
+
+    add_result_attr: bool = dataclasses.field(
+        default=False, metadata={"argument": "add-result-attr"}
+    )
+    """Add the attribute 'bufferize.result' to all output parameters."""
+
+    hoist_static_allocs: bool = dataclasses.field(
+        default=False, metadata={"argument": "hoist-static-allocs"}
+    )
+    """Hoist static allocations to call sites."""
+
+    hoist_dynamic_allocs: bool = dataclasses.field(
+        default=False, metadata={"argument": "hoist-dynamic-allocs"}
+    )
+    """Hoist dynamic allocations to call sites."""
+
+    modify_public_functions: bool = dataclasses.field(
+        default=False, metadata={"argument": "modify-public-functions"}
+    )
+    """Modify function signatures of public functions."""
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -207,6 +454,56 @@ class ControlFlowSink(Pass):
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
+class ConvertArithToEmitC(Pass):
+    """``convert-arith-to-emitc``: Convert Arith dialect to EmitC dialect"""
+
+    ARGUMENT: ClassVar[str] = "convert-arith-to-emitc"
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ConvertAsyncToLLVM(Pass):
+    """``convert-async-to-llvm``: Convert the operations from the async dialect into the LLVM dialect
+
+    Convert `async.execute` operations to LLVM coroutines and use async runtime
+    API to execute them.
+    """
+
+    ARGUMENT: ClassVar[str] = "convert-async-to-llvm"
+    ANCHOR: ClassVar[type[Operation] | None] = Module
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ConvertBufferizationToMemRef(Pass):
+    """``convert-bufferization-to-memref``: Convert operations from the Bufferization dialect to the MemRef dialect
+
+    This pass converts bufferization operations into memref operations.
+
+    In the current state, this pass only transforms a `bufferization.clone`
+    operation into `memref.alloc` and `memref.copy` operations and
+    `bufferization.dealloc` operations (the same way as the
+    `-bufferization-lower-deallocations` pass). The conversion of `clone`
+    operations is needed, since some clone operations could remain after
+    applying several transformation processes. Currently, only `canonicalize`
+    transforms clone operations or even eliminates them. This can lead to errors
+    if any clone op survived after all conversion passes (starting from the
+    bufferization dialect) are performed.
+
+    See:
+    https://llvm.discourse.group/t/bufferization-error-related-to-memref-clone/4665
+
+    To avoid these errors, this pass can be performed as a last clean-up pass to
+    transform remaining operations and to proceed in other dialects (memref
+    e.g.).
+
+    Note that this pass only transforms the operation without any further
+    analyses. This pass does not consider any memory analysis or optimization
+    and hence does not resolve any memory leaks.
+    """
+
+    ARGUMENT: ClassVar[str] = "convert-bufferization-to-memref"
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class ConvertControlFlowToLLVM(Pass):
     """``convert-cf-to-llvm``: Convert ControlFlow operations to the LLVM dialect
 
@@ -224,6 +521,14 @@ class ConvertControlFlowToLLVM(Pass):
         default=0, metadata={"argument": "index-bitwidth"}
     )
     """Bitwidth of the index type, 0 to use size of machine word"""
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ConvertFuncToEmitC(Pass):
+    """``convert-func-to-emitc``: Convert Func dialect to EmitC dialect"""
+
+    ARGUMENT: ClassVar[str] = "convert-func-to-emitc"
+    ANCHOR: ClassVar[type[Operation] | None] = Module
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -272,6 +577,45 @@ class ConvertFuncToLLVM(Pass):
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
+class ConvertMathToEmitC(Pass):
+    """``convert-math-to-emitc``: Convert some Math operations to EmitC call_opaque operations
+
+    This pass converts supported Math ops to `call_opaque` ops targeting libc/libm
+    functions. Unlike convert-math-to-funcs pass, converting to `call_opaque` ops
+    allows to overload the same function with different argument types.
+    """
+
+    ARGUMENT: ClassVar[str] = "convert-math-to-emitc"
+
+    language_target: LanguageTarget = dataclasses.field(
+        default=LanguageTarget.C99, metadata={"argument": "language-target"}
+    )
+    """Select the language standard target for callees (c99 or cpp11)."""
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ConvertMathToEmitCLibm(Pass):
+    """``convert-math-to-emitc-libm``: Turn math operations into calls to the C or C++ math library
+
+    Rewrites each scalar `f32`/`f64` math operation with a `<math.h>`
+    counterpart (`math.sqrt` to `sqrtf`/`sqrt`, `math.isnan` to `isnan`, ...)
+    as an `emitc.call_opaque`, or with `lower-to-cpp`, a call to the
+    `<cmath>` overload (`std::sqrt`). `math.rsqrt` becomes a division by the
+    square root. The module includes the header when any call is made.
+    Covers every math operation `convert-math-to-emitc` does and the rest
+    of the C99 library.
+    """
+
+    ARGUMENT: ClassVar[str] = "convert-math-to-emitc-libm"
+    ANCHOR: ClassVar[type[Operation] | None] = Module
+
+    lower_to_cpp: bool = dataclasses.field(
+        default=False, metadata={"argument": "lower-to-cpp"}
+    )
+    """Call the C++ library (std::sqrt in <cmath>) instead of C's"""
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class ConvertMathToLLVM(Pass):
     """``convert-math-to-llvm``: Convert Math dialect to LLVM dialect"""
 
@@ -281,6 +625,36 @@ class ConvertMathToLLVM(Pass):
         default=True, metadata={"argument": "approximate-log1p"}
     )
     """Enable approximation of Log1p."""
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ConvertMemRefToEmitC(Pass):
+    """``convert-memref-to-emitc``: Convert MemRef dialect to EmitC dialect"""
+
+    ARGUMENT: ClassVar[str] = "convert-memref-to-emitc"
+    ANCHOR: ClassVar[type[Operation] | None] = Module
+
+    lower_to_cpp: bool = dataclasses.field(
+        default=False, metadata={"argument": "lower-to-cpp"}
+    )
+    """Target C++ (true) instead of C (false)"""
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ConvertToEmitC(Pass):
+    """``convert-to-emitc``: Convert to EmitC dialect via dialect interfaces
+
+    This is a generic pass to convert to the EmitC dialect, it uses the
+    `ConvertToEmitCPatternInterface` dialect interface to delegate to dialects
+    the injection of conversion patterns.
+    """
+
+    ARGUMENT: ClassVar[str] = "convert-to-emitc"
+
+    filter_dialects: Sequence[str] = dataclasses.field(
+        default=(), metadata={"argument": "filter-dialects"}
+    )
+    """Test conversion patterns of only the specified dialects"""
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -315,6 +689,200 @@ class ConvertToLLVM(Pass):
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
+class ConvertVectorToLLVM(Pass):
+    """``convert-vector-to-llvm``: Lower the operations from the vector dialect into the LLVM dialect
+
+    Convert operations from the vector dialect into the LLVM IR dialect
+    operations. The lowering pass provides several options to control
+    the kinds of optimizations that are allowed. It also provides options
+    that enable the use of one or more architectural-specific dialects
+    (AMX, X86Vector, ArmNeon, ArmSVE, etc.) in combination with the
+    architectural-neutral vector dialect lowering.
+    """
+
+    ARGUMENT: ClassVar[str] = "convert-vector-to-llvm"
+
+    reassociate_fp_reductions: bool = dataclasses.field(
+        default=False, metadata={"argument": "reassociate-fp-reductions"}
+    )
+    """Allows llvm to reassociate floating-point reductions for speed"""
+
+    force_32bit_vector_indices: bool = dataclasses.field(
+        default=True, metadata={"argument": "force-32bit-vector-indices"}
+    )
+    """Allows compiler to assume vector indices fit in 32-bit if that yields faster code"""
+
+    use_vector_alignment: bool = dataclasses.field(
+        default=False, metadata={"argument": "use-vector-alignment"}
+    )
+    """Use the preferred alignment of a vector type in load/store operations instead of the alignment of the element type of the memref. This flag is intended for use with hardware which requiresvector alignment, or in application contexts where it is known all vector access are naturally aligned. If operations have an alignment attribute set, the alignment attribute takes priority over this option"""
+
+    enable_amx: bool = dataclasses.field(
+        default=False, metadata={"argument": "enable-amx"}
+    )
+    """Enables the use of AMX dialect while lowering the vector dialect."""
+
+    enable_arm_neon: bool = dataclasses.field(
+        default=False, metadata={"argument": "enable-arm-neon"}
+    )
+    """Enables the use of ArmNeon dialect while lowering the vector dialect."""
+
+    enable_arm_sve: bool = dataclasses.field(
+        default=False, metadata={"argument": "enable-arm-sve"}
+    )
+    """Enables the use of ArmSVE dialect while lowering the vector dialect."""
+
+    enable_arm_i8mm: bool = dataclasses.field(
+        default=False, metadata={"argument": "enable-arm-i8mm"}
+    )
+    """Enables the use of Arm FEAT_I8MM instructions while lowering the vector dialect."""
+
+    enable_arm_bf16: bool = dataclasses.field(
+        default=False, metadata={"argument": "enable-arm-bf16"}
+    )
+    """Enables the use of Arm FEAT_BF16 instructions while lowering the vector dialect."""
+
+    enable_x86vector: bool = dataclasses.field(
+        default=False, metadata={"argument": "enable-x86vector"}
+    )
+    """Enables the use of X86Vector dialect while lowering the vector dialect."""
+
+    vector_contract_lowering: VectorContractLowering = dataclasses.field(
+        default=VectorContractLowering.DOT,
+        metadata={"argument": "vector-contract-lowering"},
+    )
+    """control the lowering of `vector.contract` operations."""
+
+    vector_transpose_lowering: VectorTransposeLowering = dataclasses.field(
+        default=VectorTransposeLowering.ELTWISE,
+        metadata={"argument": "vector-transpose-lowering"},
+    )
+    """control the lowering of `vector.transpose` operations."""
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ConvertVectorToSCF(Pass):
+    """``convert-vector-to-scf``: Lower the operations from the vector dialect into the SCF dialect"""
+
+    ARGUMENT: ClassVar[str] = "convert-vector-to-scf"
+
+    full_unroll: bool = dataclasses.field(
+        default=False, metadata={"argument": "full-unroll"}
+    )
+    """Perform full unrolling when converting vector transfers to SCF"""
+
+    target_rank: int = dataclasses.field(
+        default=1, metadata={"argument": "target-rank"}
+    )
+    """Target vector rank to which transfer ops should be lowered"""
+
+    lower_tensors: bool = dataclasses.field(
+        default=False, metadata={"argument": "lower-tensors"}
+    )
+    """Lower transfer ops that operate on tensors"""
+
+    lower_scalable: bool = dataclasses.field(
+        default=False, metadata={"argument": "lower-scalable"}
+    )
+    """Add scalable vector specific lowerings (that introduce loops)"""
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class DropEquivalentBufferResults(Pass):
+    """``drop-equivalent-buffer-results``: Remove MemRef return values that are equivalent to a bbArg
+
+    This pass removes MemRef return values from functions if they are equivalent
+    to a function bbArg. In that case, the return value is redundant and the
+    respective CallOp operand can be used at the call site.
+
+    Note: If a bbArg buffer is not returned directly but casted to beforehand,
+    the buffer is still considered equivalent.
+    """
+
+    ARGUMENT: ClassVar[str] = "drop-equivalent-buffer-results"
+    ANCHOR: ClassVar[type[Operation] | None] = Module
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class EmptyTensorElimination(Pass):
+    """``eliminate-empty-tensors``: Try to eliminate all tensor.empty ops.
+
+    Try to eliminate "tensor.empty" ops inside `op`. This transformation looks
+    for subset ops that insert a tensor that originates from a "tensor.empty"
+    (as per the reverse use-def chain). Such "tensor.empty" ops are replaced
+    with the destination subset.
+
+    E.g.:
+    ```
+    %0 = tensor.empty() : tensor<10xf32>
+    %1 = linalg.fill ... outs(%0 : tensor<10xf32>)
+    %2 = tensor.insert_slice %1 into %t ...
+    ```
+
+    In the above example, the subset op is "tensor.insert_slice". When tracing
+    back the reverse use-def chain of a the source, we end up at a
+    "tensor.empty" op. The "tensor.empty" op is replaced with a
+    "tensor.extract_slice" op.
+    """
+
+    ARGUMENT: ClassVar[str] = "eliminate-empty-tensors"
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class EmptyTensorToAllocTensor(Pass):
+    """``empty-tensor-to-alloc-tensor``: Replace all empty ops by alloc_tensor ops.
+
+    tensor.empty ops return a tensor of unspecified contents who's only purpose
+    is to carry the tensor shape. This pass converts such ops to
+    bufferization.alloc_tensor ops, which bufferize to buffer allocations.
+    """
+
+    ARGUMENT: ClassVar[str] = "empty-tensor-to-alloc-tensor"
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ExpandRealloc(Pass):
+    """``expand-realloc``: Expand memref.realloc operations into its components
+
+    The `memref.realloc` operation performs a conditional allocation and copy to
+    increase the size of a buffer if necessary. This pass converts a `realloc`
+    operation into this sequence of simpler operations such that other passes
+    at a later stage in the compilation pipeline do not have to consider the
+    `realloc` operation anymore (e.g., the buffer deallocation pass and the
+    conversion pass to LLVM).
+
+    Example of an expansion:
+    ```mlir
+    %realloc = memref.realloc %alloc (%size) : memref<?xf32> to memref<?xf32>
+    ```
+    is expanded to
+    ```mlir
+    %c0 = arith.constant 0 : index
+    %dim = memref.dim %alloc, %c0 : memref<?xf32>
+    %is_old_smaller = arith.cmpi ult, %dim, %arg1
+    %realloc = scf.if %is_old_smaller -> (memref<?xf32>) {
+      %new_alloc = memref.alloc(%size) : memref<?xf32>
+      %subview = memref.subview %new_alloc[0] [%dim] [1]
+      memref.copy %alloc, %subview
+      memref.dealloc %alloc
+      scf.yield %alloc_0 : memref<?xf32>
+    } else {
+      %reinterpret_cast = memref.reinterpret_cast %alloc to
+        offset: [0], sizes: [%size], strides: [1]
+      scf.yield %reinterpret_cast : memref<?xf32>
+    }
+    ```
+    """
+
+    ARGUMENT: ClassVar[str] = "expand-realloc"
+
+    emit_deallocs: bool = dataclasses.field(
+        default=True, metadata={"argument": "emit-deallocs"}
+    )
+    """Emit deallocation operations for the original MemRef"""
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class FinalizeMemRefToLLVMConversion(Pass):
     """``finalize-memref-to-llvm``: Finalize MemRef dialect to LLVM dialect conversion
 
@@ -342,6 +910,17 @@ class FinalizeMemRefToLLVMConversion(Pass):
         default=False, metadata={"argument": "use-generic-functions"}
     )
     """Use generic allocation and deallocation functions instead of the classic 'malloc', 'aligned_alloc' and 'free' functions"""
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class FormExpressions(Pass):
+    """``form-expressions``: Form C-style expressions from C-operator ops
+
+    The pass wraps emitc ops modelling C operators in emitc.expression ops and
+    then folds single-use expressions into their users where possible.
+    """
+
+    ARGUMENT: ClassVar[str] = "form-expressions"
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -386,6 +965,29 @@ class Inliner(Pass):
         default=-1, metadata={"argument": "inlining-threshold"}
     )
     """If the ratio between the number of the operations in the callee and the number of the operations in the caller exceeds this value (in percentage), then the callee is not inlined even if it is legal to inline it"""
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class LiftControlFlowToSCF(Pass):
+    """``lift-cf-to-scf``: Lift ControlFlow dialect to SCF dialect
+
+    Lifts ControlFlow operations to SCF dialect operations.
+
+    This pass is prefixed with "lift" instead of "convert" as it is not always
+    guaranteed to replace all ControlFlow ops.
+    If a region contains only a single kind of return-like operation, all
+    ControlFlow operations will be replaced successfully.
+    Otherwise a single ControlFlow switch branching to one block per return-like
+    operation kind remains.
+
+    This pass may need to create unreachable terminators in case of infinite
+    loops, which is only supported for 'func.func' for now. If you potentially
+    have infinite loops inside CFG regions not belonging to 'func.func',
+    consider using `transformCFGToSCF` function directly with corresponding
+    `CFGToSCFInterface::createUnreachableTerminator` implementation.
+    """
+
+    ARGUMENT: ClassVar[str] = "lift-cf-to-scf"
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -469,6 +1071,53 @@ class LoopInvariantSubsetHoisting(Pass):
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
+class LowerDeallocations(Pass):
+    """``bufferization-lower-deallocations``: Lowers `bufferization.dealloc` operations to `memref.dealloc`operations
+
+    This pass lowers `bufferization.dealloc` operations to the `memref` dialect.
+    It can be applied to a `builtin.module` or operations implementing the
+    `FunctionOpInterface`. For the latter, only simple `dealloc` operations can
+    be lowered because the library function necessary for the fully generic
+    lowering cannot be inserted. In this case, an error will be emitted.
+    Next to `memref.dealloc` operations, it may also emit operations from the
+    `arith`, `scf`, and `func` dialects to build conditional deallocations and
+    library functions to avoid code-size blow-up.
+    """
+
+    ARGUMENT: ClassVar[str] = "bufferization-lower-deallocations"
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class LowerVectorMask(Pass):
+    """``lower-vector-mask``: Lower 'vector.mask' operations"""
+
+    ARGUMENT: ClassVar[str] = "lower-vector-mask"
+    ANCHOR: ClassVar[type[Operation] | None] = func.FuncOp
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class LowerVectorMultiReduction(Pass):
+    """``lower-vector-multi-reduction``: Lower 'vector.multi_reduction' operations"""
+
+    ARGUMENT: ClassVar[str] = "lower-vector-multi-reduction"
+    ANCHOR: ClassVar[type[Operation] | None] = func.FuncOp
+
+    lowering_strategy: VectorMultiReductionLowering = dataclasses.field(
+        default=VectorMultiReductionLowering.INNER_PARALLEL,
+        metadata={"argument": "lowering-strategy"},
+    )
+    """Select the strategy to control how multi_reduction is lowered."""
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class LowerVectorToFromElementsToShuffleTree(Pass):
+    """``lower-vector-to-from-elements-to-shuffle-tree``: Lower `vector.to_elements` and `vector.from_elements` to a tree of `vector.shuffle` operations"""
+
+    ARGUMENT: ClassVar[str] = "lower-vector-to-from-elements-to-shuffle-tree"
+    ANCHOR: ClassVar[type[Operation] | None] = func.FuncOp
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class Mem2Reg(Pass):
     """``mem2reg``: Promotes memory slots into values.
 
@@ -496,6 +1145,357 @@ class Mem2Reg(Pass):
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
+class OneShotBufferize(Pass):
+    """``one-shot-bufferize``: One-Shot Bufferize
+
+    This pass bufferizes all ops that implement `BufferizableOpInterface`. It
+    first performs an inplacability analysis on SSA use-def chains of tensor
+    values to determine which OpOperands may bufferize in-place, i.e., without
+    inserting a buffer copy. It then rewrites the IR, inserting a buffer
+    allocation and copy for each OpOperand that was decided to bufferize
+    out-of-place.
+
+    One-Shot Bufferize (and `BufferizableOpInterface`) was designed for ops that
+    are in destination-passing style. When bufferizing such ops, it is possible
+    to reuse the buffer of a tensor OpOperand for a tensor OpResult. In essence,
+    a possible destination of an operation is already passed as an SSA value.
+
+    `tensor.insert` is an example for an op in destination-passing style. E.g.,
+    when bufferizing `%t0 = tensor.insert %f into %dest[%idx]`, `buffer(%t0)` is
+    identical to `buffer(%dest)` in the absence of RaW conflicts. As a counter
+    example, `tensor.generate` is not in destination-passing style and always
+    results in a new buffer allocation.
+
+    One-Shot Bufferize does not deallocate any buffers that it allocates. The
+    `-buffer-deallocation-pipeline` pipeline should be run after One-Shot
+    Bufferize to insert the deallocation operations necessary to eliminate
+    memory leaks.
+
+    One-Shot Bufferize will by default reject IR that contains non-bufferizable
+    op, i.e., ops that do not implemement BufferizableOpInterface. Such IR can
+    be allowed with `allow-unknown-ops=1`. In that case, to_buffer and to_tensor
+    ops will be generated at the bufferization boundary. This is useful for
+    compatibility with existing partial bufferization passes: These can
+    bufferize the remaining IR after running One-Shot Bufferize.
+
+    Note: Running One-Shot Bufferize after a partial bufferization pass is
+    currently not supported. Running partial bufferization passes after running
+    One-Shot Bufferize is supported and the recommended way to gradually
+    migrate from partial bufferization to One-Shot Bufferize.
+
+    With `dialect-filter`, bufferization can be restricted to a set of dialects.
+    If no filter is specified, all ops that implement `BufferizableOpInterface`
+    are bufferized. Ops from the `std` dialect are an exception: These ops are
+    always ignored, even if no filter is specified. When specifying a dialect
+    filter and `allow-unknown-ops` is not turned on, bufferization would fail
+    when encountering an op that is not included in the filter (even if it is
+    bufferizable).
+
+    One-Shot Bufferize will by default assume memref types with fully dynamic
+    layout maps when a precise layout cannot be inferred. E.g., this is the case
+    when wrapping a non-bufferizable op in to_buffer/to_tensor ops. This
+    behavior can be overridden with `unknown-type-conversion`. Valid values are
+    `fully-dynamic-layout-map` and `identity-layout-map`.
+
+    For testing/debugging purposes, `test-analysis-only=1 print-conflicts=1`
+    prints analysis results and explains why an OpOperand was decided to
+    bufferize out-of-place. This is useful for understanding why One-Shot
+    Bufferize chose to insert a certain buffer copy.
+
+    `bufferize-function-boundaries` is an experimental flag for bufferizing
+    `FuncOp`, `ReturnOp` and `CallOp`. This feature is still under development
+    and supports only simple cases at the moment. In particular:
+
+    * Recursive or circular function call graphs are not supported.
+    * External functions (without bodies) that return a tensor are not
+      supported.
+    * Function with multiple blocks or multiple ReturnOps are not supported.
+    * Layout maps on function signatures can be controlled with a separate
+      `function-boundary-type-conversion` option, which is similar to
+      `unknown-type-conversion` but supports an additional `infer-layout-map`
+      option. `fully-dynamic-layout-map` and `identity-layout-map` ensure that
+      function signatures bufferize to easily predictable types, potentially at
+      the cost of additional casts and copies, respectively. When layout maps
+      are inferred, function return types may be more precise, but less
+      predictable. Function argument types cannot be inferred and always have
+      fully dynamic layout maps with `infer-layout-map`.
+
+    One-Shot Bufferize implements the following contract around function calls:
+    The buffer of function arguments is always writable (unless annotated with
+    `bufferization.writable = false`). A buffer copy may be inserted at the call
+    site where necessary. Alias sets and equivalence info is propagated through
+    function calls. Whenever a function is bufferized, all other functions that
+    are being called were already analyzed and bufferized, so exact alias and
+    equivalence information is available. This is why recursive function calls
+    are not yet supported.
+
+    One-Shot Bufferize gathers additional information during the analysis phase
+    when function boundary bufferization is activated. E.g., whether a function
+    argument is read/written and which returned values are aliasing/equivalent.
+    For debugging purposes, such information can be printed with
+    `test-analysis-only`.
+
+    The order in which ops are analyzed is important. The analysis is greedy and
+    ops that are analyzed earlier are more likely to bufferize in-place. The
+    heuristic can be set with `analysis-heuristic`. At the moment, the following
+    heuristics are available:
+
+    * `bottom-up` (default): Analyze ops from bottom to top.
+    * `top-down`: Analyze ops from top to bottom.
+    * `fuzzer`: Randomize the ordering of ops with `analysis-fuzzer-seed`.
+    * `bottom-up-from-terminators`: Traverse the reverse use-def chains of
+      tensor IR, starting from region branch terminators (bottom-up). Nested
+      regions are traversed before enclosing regions. Analyze the traversed ops
+      first, then analyze the remaining ops bottom-up. This heuristic is useful
+      for bufferizing loop constructs. One-Shot Bufferize currently supports
+      only such IR where yielded tensor values bufferize to equivalent region
+      iter_args, and first analyzing all ops on the path from the "yielding" op
+      to the beginning of the loop body makes it more likely for the region
+      iter_args and yielded values to bufferize to equivalent buffers.
+    """
+
+    ARGUMENT: ClassVar[str] = "one-shot-bufferize"
+    ANCHOR: ClassVar[type[Operation] | None] = Module
+
+    allow_return_allocs_from_loops: bool = dataclasses.field(
+        default=False, metadata={"argument": "allow-return-allocs-from-loops"}
+    )
+    """Allows returning/yielding new allocations from a loop."""
+
+    allow_unknown_ops: bool = dataclasses.field(
+        default=False, metadata={"argument": "allow-unknown-ops"}
+    )
+    """Allows unknown (not bufferizable) ops in the input IR."""
+
+    analysis_fuzzer_seed: int = dataclasses.field(
+        default=0, metadata={"argument": "analysis-fuzzer-seed"}
+    )
+    """Test only: Analyze ops in random order with a given seed (fuzzer)"""
+
+    analysis_heuristic: str = dataclasses.field(
+        default="bottom-up", metadata={"argument": "analysis-heuristic"}
+    )
+    """Heuristic that control the IR traversal during analysis"""
+
+    bufferize_function_boundaries: bool | None = dataclasses.field(
+        default=None, metadata={"argument": "bufferize-function-boundaries"}
+    )
+    """Bufferize function boundaries (experimental)."""
+
+    check_parallel_regions: bool = dataclasses.field(
+        default=True, metadata={"argument": "check-parallel-regions"}
+    )
+    """Account for parallel regions in RaW analysis."""
+
+    copy_before_write: bool = dataclasses.field(
+        default=False, metadata={"argument": "copy-before-write"}
+    )
+    """Skip the analysis. Make a buffer copy on every write."""
+
+    dialect_filter: Sequence[str] = dataclasses.field(
+        default=(), metadata={"argument": "dialect-filter"}
+    )
+    """Restrict bufferization to ops from these dialects."""
+
+    dump_alias_sets: bool = dataclasses.field(
+        default=False, metadata={"argument": "dump-alias-sets"}
+    )
+    """Test only: Annotate tensor IR with alias sets"""
+
+    no_analysis_func_filter: Sequence[str] = dataclasses.field(
+        default=(), metadata={"argument": "no-analysis-func-filter"}
+    )
+    """Skip analysis of functions with these symbol names.Set copyBeforeWrite to true when bufferizing them."""
+
+    function_boundary_type_conversion: LayoutMapOption = dataclasses.field(
+        default=LayoutMapOption.INFER_LAYOUT_MAP,
+        metadata={"argument": "function-boundary-type-conversion"},
+    )
+    """Controls layout maps when bufferizing function signatures."""
+
+    must_infer_memory_space: bool = dataclasses.field(
+        default=False, metadata={"argument": "must-infer-memory-space"}
+    )
+    """The memory space of an memref types must always be inferred. If unset, a default memory space of 0 is used otherwise."""
+
+    use_encoding_for_memory_space: bool = dataclasses.field(
+        default=False, metadata={"argument": "use-encoding-for-memory-space"}
+    )
+    """Use the Tensor encoding attribute for the memory space. Exclusive to the 'must-infer-memory-space' option"""
+
+    test_analysis_only: bool = dataclasses.field(
+        default=False, metadata={"argument": "test-analysis-only"}
+    )
+    """Test only: Only run inplaceability analysis and annotate IR"""
+
+    print_conflicts: bool = dataclasses.field(
+        default=False, metadata={"argument": "print-conflicts"}
+    )
+    """Test only: Annotate IR with RaW conflicts. Requires test-analysis-only."""
+
+    unknown_type_conversion: LayoutMapOption = dataclasses.field(
+        default=LayoutMapOption.FULLY_DYNAMIC_LAYOUT_MAP,
+        metadata={"argument": "unknown-type-conversion"},
+    )
+    """Controls layout maps for non-inferrable memref types."""
+
+    buffer_alignment: int = dataclasses.field(
+        default=64, metadata={"argument": "buffer-alignment"}
+    )
+    """Sets the alignment of newly allocated buffers."""
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class OptimizeAllocationLiveness(Pass):
+    """``optimize-allocation-liveness``: This pass optimizes the liveness of temp allocations in the input function
+
+    This pass will find all operations that have a memory allocation effect.
+    It will search for the corresponding deallocation and move it right after
+    the last user of the allocation.
+    This will optimize the liveness of the allocations.
+
+    The pass is expected to run after the deallocation pipeline.
+    """
+
+    ARGUMENT: ClassVar[str] = "optimize-allocation-liveness"
+    ANCHOR: ClassVar[type[Operation] | None] = func.FuncOp
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class OwnershipBasedBufferDeallocation(Pass):
+    """``ownership-based-buffer-deallocation``: Adds all required dealloc operations for all allocations in the input program
+
+    This pass implements an algorithm to automatically introduce all required
+    deallocation operations for all buffers in the input program. This ensures
+    that the resulting program does not have any memory leaks.
+
+    The Buffer Deallocation pass operates on the level of operations
+    implementing the FunctionOpInterface. Such operations can take MemRefs as
+    arguments, but also return them. To ensure compatibility among all functions
+    (including external ones), some rules have to be enforced. They are just
+    assumed to hold for all external functions. Functions for which the
+    definition is available ideally also already adhere to the ABI.
+    Otherwise, all MemRef write operations in the input IR must dominate all
+    MemRef read operations in the input IR. Then, the pass may modify the input
+    IR by inserting `bufferization.clone` operations such that the output IR
+    adheres to the function boundary ABI:
+    * When a MemRef is passed as a function argument, ownership is never
+      acquired. It is always the caller's responsibility to deallocate such
+      MemRefs.
+    * Returning a MemRef from a function always passes ownership to the caller,
+      i.e., it is also the caller's responsibility to deallocate MemRefs
+      returned from a called function.
+    * A function must not return a MemRef with the same allocated base buffer as
+      one of its arguments (in this case a copy has to be created). Note that in
+      this context two subviews of the same buffer that don't overlap are also
+      considered an alias.
+
+    It is recommended to bufferize all operations first such that no tensor
+    values remain in the IR once this pass is applied. That way all allocated
+    MemRefs will be properly deallocated without any additional manual work.
+    Otherwise, the pass that bufferizes the remaining tensors is responsible to
+    add the corresponding deallocation operations. Note that this pass does not
+    consider any values of tensor type and assumes that MemRef values defined by
+    `bufferization.to_buffer` do not return ownership and do not have to be
+    deallocated. `bufferization.to_tensor` operations are handled similarly to
+    `bufferization.clone` operations with the exception that the result value is
+    not handled because it's a tensor (not a MemRef).
+
+    Input
+
+    ```mlir
+    #map0 = affine_map<(d0) -> (d0)>
+    module {
+      func.func @condBranch(%arg0: i1,
+                            %arg1: memref<2xf32>,
+                            %arg2: memref<2xf32>) {
+        cf.cond_br %arg0, ^bb1, ^bb2
+      ^bb1:
+        cf.br ^bb3(%arg1 : memref<2xf32>)
+      ^bb2:
+        %0 = memref.alloc() : memref<2xf32>
+        linalg.generic {
+          indexing_maps = [#map0, #map0],
+          iterator_types = ["parallel"]}
+        outs(%arg1, %0 : memref<2xf32>, memref<2xf32>) {
+        ^bb0(%gen1_arg0: f32, %gen1_arg1: f32):
+          %tmp1 = exp %gen1_arg0 : f32
+          linalg.yield %tmp1 : f32
+        }
+        cf.br ^bb3(%0 : memref<2xf32>)
+      ^bb3(%1: memref<2xf32>):
+        "memref.copy"(%1, %arg2) : (memref<2xf32>, memref<2xf32>) -> ()
+        return
+      }
+    }
+    ```
+
+    Output
+
+    ```mlir
+    #map = affine_map<(d0) -> (d0)>
+    module {
+      func.func @condBranch(%arg0: i1,
+                            %arg1: memref<2xf32>,
+                            %arg2: memref<2xf32>) {
+        %false = arith.constant false
+        %true = arith.constant true
+        cf.cond_br %arg0, ^bb1, ^bb2
+      ^bb1:  // pred: ^bb0
+        cf.br ^bb3(%arg1, %false : memref<2xf32>, i1)
+      ^bb2:  // pred: ^bb0
+        %alloc = memref.alloc() : memref<2xf32>
+        linalg.generic {
+          indexing_maps = [#map, #map],
+          iterator_types = ["parallel"]}
+        outs(%arg1, %alloc : memref<2xf32>, memref<2xf32>)
+        ^bb0(%out: f32, %out_0: f32):
+          %2 = math.exp %out : f32
+          linalg.yield %2, %out_0 : f32, f32
+        }
+        cf.br ^bb3(%alloc, %true : memref<2xf32>, i1)
+      ^bb3(%0: memref<2xf32>, %1: i1):  // 2 preds: ^bb1, ^bb2
+        memref.copy %0, %arg2 : memref<2xf32> to memref<2xf32>
+        %base_buffer, %offset, %sizes, %strides =
+          memref.extract_strided_metadata %0 :
+          memref<2xf32> -> memref<f32>, index, index, index
+        bufferization.dealloc (%base_buffer : memref<f32>) if (%1)
+        return
+      }
+    }
+    ```
+
+    The `private-function-dynamic-ownership` pass option allows the pass to add
+    additional arguments to private functions to dynamically give ownership of
+    MemRefs to callees. This can enable earlier deallocations and allows the
+    pass to by-pass the function boundary ABI and thus potentially leading to
+    fewer MemRef clones being inserted. For example, the private function
+    ```mlir
+    func.func private @passthrough(%memref: memref<2xi32>) -> memref<2xi32> {
+      return %memref : memref<2xi32>
+    }
+    ```
+    would be converted to
+    ```mlir
+    func.func private @passthrough(%memref: memref<2xi32>,
+                                   %ownership: i1) -> (memref<2xi32>, i1) {
+      return %memref, %ownership : memref<2xi32>, i1
+    }
+    ```
+    and thus allows the returned MemRef to alias with the MemRef passed as
+    argument (which would otherwise be forbidden according to the function
+    boundary ABI).
+    """
+
+    ARGUMENT: ClassVar[str] = "ownership-based-buffer-deallocation"
+
+    private_function_dynamic_ownership: bool = dataclasses.field(
+        default=False, metadata={"argument": "private-function-dynamic-ownership"}
+    )
+    """Allows to add additional arguments to private functions to dynamically pass ownership of memrefs to callees. This can enable earlier deallocations."""
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class PrintIR(Pass):
     """``print-ir``: Print IR on the debug stream
 
@@ -517,6 +1517,31 @@ class PrintOpStats(Pass):
 
     json: bool = dataclasses.field(default=False, metadata={"argument": "json"})
     """print the stats as JSON"""
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PromoteBuffersToStack(Pass):
+    """``promote-buffers-to-stack``: Promotes heap-based allocations to automatically managed stack-based allocations
+
+    This pass implements a simple algorithm to convert heap-based memory
+    allocations to stack-based ones. It uses a built-in heuristic to decide
+    whether it makes sense to convert an allocation. Furthermore, dynamic
+    shaped buffers that are limited by the rank of the tensor can be
+    converted. They are only transformed if they are considered to be small.
+    """
+
+    ARGUMENT: ClassVar[str] = "promote-buffers-to-stack"
+    ANCHOR: ClassVar[type[Operation] | None] = func.FuncOp
+
+    max_alloc_size_in_bytes: int = dataclasses.field(
+        default=1024, metadata={"argument": "max-alloc-size-in-bytes"}
+    )
+    """Maximal size in bytes to promote allocations to stack."""
+
+    max_rank_of_allocated_memref: int = dataclasses.field(
+        default=1, metadata={"argument": "max-rank-of-allocated-memref"}
+    )
+    """Maximal memref rank to promote dynamic buffers."""
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -741,6 +1766,13 @@ class SCFToControlFlow(Pass):
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
+class SCFToEmitC(Pass):
+    """``convert-scf-to-emitc``: Convert SCF dialect to EmitC dialect, maintaining structured control flow"""
+
+    ARGUMENT: ClassVar[str] = "convert-scf-to-emitc"
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class SROA(Pass):
     """``sroa``: Scalar Replacement of Aggregates
 
@@ -865,6 +1897,20 @@ class UBToLLVMConversion(Pass):
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
+class UpliftWhileToFor(Pass):
+    """``scf-uplift-while-to-for``: Turn counted scf.while loops into scf.for
+
+    Rewrites an `scf.while` loop whose condition compares an induction
+    variable against a loop-invariant bound (`slt`/`sgt`) and whose body adds
+    a loop-invariant step into an `scf.for` loop, the form that later
+    parallelization and vectorization expect. Other loops are left as they
+    are. Wraps MLIR's `populateUpliftWhileToForPatterns`.
+    """
+
+    ARGUMENT: ClassVar[str] = "scf-uplift-while-to-for"
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class ViewOpGraph(Pass):
     """``view-op-graph``: Print Graphviz visualization of an operation
 
@@ -909,40 +1955,118 @@ class ViewOpGraph(Pass):
     """Print result types of operations"""
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class WrapFuncInClass(Pass):
+    """``wrap-emitc-func-in-class``: Wrap functions in classes, using arguments as fields.
+
+    This pass transforms `emitc.func` operations into `emitc.class` operations.
+    Function arguments become fields of the class, and the function body is moved
+    to a new `execute` method within the class.
+    If the corresponding function argument has attributes (accessed via `argAttrs`),
+    these attributes are attached to the field operation.
+    Otherwise, the field is created without additional attributes.
+
+    Example:
+
+    ```mlir
+    emitc.func @model(%input_data : !emitc.array<1xf32> {emitc.opaque = "input_tensor"}) attributes { } {
+      %0 = "emitc.constant"() <{value = 0 : index}> : () -> !emitc.size_t
+      %1 = subscript %input_data[%0] : (!emitc.array<1xf32>, !emitc.size_t) -> !emitc.lvalue<f32>
+      return
+    }
+    // becomes
+    emitc.class @modelClass {
+      emitc.field @input_tensor : !emitc.array<1xf32> {emitc.opaque = "input_tensor"}
+      emitc.func @execute() {
+        %0 = "emitc.constant"() <{value = 0 : index}> : () -> !emitc.size_t
+        %1 = get_field @input_tensor : !emitc.array<1xf32>
+        %2 = subscript %1[%0] : (!emitc.array<1xf32>, !emitc.size_t) -> !emitc.lvalue<f32>
+        return
+      }
+    }
+    ```
+    """
+
+    ARGUMENT: ClassVar[str] = "wrap-emitc-func-in-class"
+
+
 __all__ = [
     "CSE",
     "SCCP",
     "SROA",
     "ArithToLLVMConversion",
+    "AsyncFuncToAsyncRuntime",
+    "AsyncParallelFor",
+    "AsyncRuntimePolicyBasedRefCounting",
+    "AsyncRuntimeRefCounting",
+    "AsyncRuntimeRefCountingOpt",
+    "AsyncToAsyncRuntime",
     "BubbleDownMemorySpaceCasts",
+    "BufferDeallocationSimplification",
+    "BufferHoisting",
+    "BufferLoopHoisting",
+    "BufferResultsToOutParams",
     "Canonicalizer",
     "CompositeFixedPoint",
     "ControlFlowSink",
+    "ConvertArithToEmitC",
+    "ConvertAsyncToLLVM",
+    "ConvertBufferizationToMemRef",
     "ConvertControlFlowToLLVM",
+    "ConvertFuncToEmitC",
     "ConvertFuncToLLVM",
+    "ConvertMathToEmitC",
+    "ConvertMathToEmitCLibm",
     "ConvertMathToLLVM",
+    "ConvertMemRefToEmitC",
+    "ConvertToEmitC",
     "ConvertToLLVM",
+    "ConvertVectorToLLVM",
+    "ConvertVectorToSCF",
+    "DropEquivalentBufferResults",
+    "EmptyTensorElimination",
+    "EmptyTensorToAllocTensor",
+    "ExpandRealloc",
     "FinalizeMemRefToLLVMConversion",
+    "FormExpressions",
     "GenerateRuntimeVerification",
     "GreedySimplifyRegionLevel",
     "Inliner",
+    "LanguageTarget",
+    "LayoutMapOption",
+    "LiftControlFlowToSCF",
     "LocationSnapshot",
     "LoopInvariantCodeMotion",
     "LoopInvariantSubsetHoisting",
+    "LowerDeallocations",
+    "LowerVectorMask",
+    "LowerVectorMultiReduction",
+    "LowerVectorToFromElementsToShuffleTree",
     "Mem2Reg",
     "Nested",
+    "OneShotBufferize",
+    "OptimizeAllocationLiveness",
+    "OwnershipBasedBufferDeallocation",
     "Pass",
     "PassManager",
     "PipelineElement",
     "PrintIR",
     "PrintOpStats",
+    "PromoteBuffersToStack",
+    "PythonPass",
     "ReconcileUnrealizedCasts",
     "RemoveDeadValues",
     "SCFToControlFlow",
+    "SCFToEmitC",
     "StripDebugInfo",
     "SymbolDCE",
     "SymbolPrivatize",
     "TopologicalSort",
     "UBToLLVMConversion",
+    "UpliftWhileToFor",
+    "VectorContractLowering",
+    "VectorMultiReductionLowering",
+    "VectorTransposeLowering",
     "ViewOpGraph",
+    "WrapFuncInClass",
 ]

@@ -22,7 +22,7 @@ from mlir_python.lang import (
     stack,
     struct,
 )
-from mlir_python.lang.types import FnType
+from mlir_python.lang._types import FnType  # the runtime class the compiler uses
 
 program = Program()
 
@@ -125,14 +125,19 @@ def test_compiled_code_calls_c_through_values() -> None:
     assert untyped_round_trip(4) == 8
 
 
-def test_fn_types() -> None:
-    kind = Fn[[i32, ptr], None]
+def runtime(kind: object) -> FnType:
+    """What ``Fn[...]`` is at runtime: a ``FnType`` (a class to type checkers)."""
     assert isinstance(kind, FnType)
+    return kind
+
+
+def test_fn_types() -> None:
+    kind = runtime(Fn[[i32, ptr], None])
     assert kind.name == "Fn[[i32, ptr], None]"
-    assert kind == Fn[[i32, ptr], None]
+    assert kind == runtime(Fn[[i32, ptr], None])
     assert kind.size == 8
     with pytest.raises(TypeError, match="Fn\\[\\[parameter types\\], result type\\]"):
-        Fn[i32, i32]
+        Fn[i32, i32]  # pyright: ignore[reportInvalidTypeArguments]
 
 
 def test_function_values_cross_modules() -> None:
@@ -208,11 +213,17 @@ def test_typed_pointers_stand_for_opaque_ones_in_function_types() -> None:
     # A function taking Ptr[i32] fits a callback type taking ptr (C's void *).
     from mlir_python.lang._compiler import fits_function_type
 
-    assert fits_function_type(Fn[[Ptr[i32], i32], i32], Fn[[ptr, i32], i32])
-    assert fits_function_type(Fn[[ptr], None], Fn[[Ptr[i32]], None])
-    assert not fits_function_type(Fn[[Ptr[i32]], i32], Fn[[i32], i32])
-    assert not fits_function_type(Fn[[Ptr[i32]], i32], Fn[[ptr, ptr], i32])
-    assert not fits_function_type(Fn[[Ptr[i32]], i32], Fn[[Ptr[i64]], i32])
+    assert fits_function_type(
+        runtime(Fn[[Ptr[i32], i32], i32]), runtime(Fn[[ptr, i32], i32])
+    )
+    assert fits_function_type(runtime(Fn[[ptr], None]), runtime(Fn[[Ptr[i32]], None]))
+    assert not fits_function_type(runtime(Fn[[Ptr[i32]], i32]), runtime(Fn[[i32], i32]))
+    assert not fits_function_type(
+        runtime(Fn[[Ptr[i32]], i32]), runtime(Fn[[ptr, ptr], i32])
+    )
+    assert not fits_function_type(
+        runtime(Fn[[Ptr[i32]], i32]), runtime(Fn[[Ptr[i64]], i32])
+    )
     assert "read_state" in str(program.mlir)  # passing it compiles (see below)
 
 
@@ -220,7 +231,9 @@ def test_typed_pointers_stand_for_opaque_ones_in_function_types() -> None:
 def pass_typed_callback(x: i32) -> i32:
     slot = stack(i32)
     slot[0] = 40
-    return apply_state(read_state, slot, x)
+    # Like C, the compiler lets a function taking Ptr[i32] stand in for a
+    # callback taking ptr (void *); type checkers only see a narrower callback.
+    return apply_state(read_state, slot, x)  # pyright: ignore[reportArgumentType]
 
 
 @program.function

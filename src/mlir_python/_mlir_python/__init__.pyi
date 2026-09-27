@@ -5,13 +5,18 @@ from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
 from typing import Self
 
 from . import arith as arith
+from . import async_dialect as async_dialect
+from . import bufferization as bufferization
 from . import cf as cf
+from . import emitc as emitc
 from . import func as func
+from . import irdl as irdl
 from . import llvm as llvm
 from . import math as math
 from . import memref as memref
 from . import scf as scf
 from . import tensor as tensor
+from . import vector as vector
 
 class MLIRError(Exception):
     """
@@ -1506,6 +1511,18 @@ class Module(Operation):
     def body(self) -> Block:
         """The module's single block."""
 
+def register_python_pass(argument: str, description: str, run: Callable) -> None:
+    """
+    Low level: register a pass named ``argument`` that calls ``run`` with
+    each operation it runs on (see ``passes.PythonPass``).
+    """
+
+def release_python_passes() -> None:
+    """
+    Low level: release the callables of registered Python passes (run
+    at interpreter exit).
+    """
+
 class ParsedPassPipeline:
     """
     A pass pipeline parsed from MLIR's textual syntax, ready to run.
@@ -1616,6 +1633,20 @@ def translate_to_llvm_ir(module: Operation) -> LLVMModule:
         MLIRError: If the module still contains non-LLVM operations.
     """
 
+def translate_to_cpp(
+    module: Operation, *, declare_variables_at_top: bool = False
+) -> str:
+    """
+    Translate an MLIR module in the EmitC dialect to C or C++ source.
+
+    With ``declare_variables_at_top``, each function declares all its
+    variables before its first statement (needed for C89 and for
+    functions with more than one block).
+
+    Raises:
+        MLIRError: If the module contains operations EmitC cannot print.
+    """
+
 class ExecutionEngine:
     """
     JIT-compiles an MLIR module in the LLVM dialect into this process.
@@ -1650,12 +1681,24 @@ class ExecutionEngine:
         signature: FunctionType,
         args: Sequence[int | float | bool | Buffer],
         /,
-    ) -> int | float | bool | tuple[int | float | bool, ...] | None:
+        *,
+        owned_results: bool = False,
+    ) -> (
+        int
+        | float
+        | bool
+        | memoryview
+        | tuple[int | float | bool | memoryview, ...]
+        | None
+    ):
         """
         Low level: call function ``name`` of type ``signature`` with
         ``args``: Python numbers for scalars, writable buffers (such as
         NumPy arrays) for memrefs, which the function reads and writes in
-        place. Returns ``None``, one value, or a tuple of values.
+        place. Returns ``None``, one value, or a tuple of values; a memref
+        result is copied into a new ``memoryview`` shaped like it. With
+        ``owned_results``, memref results are buffers the function
+        allocated for the caller, freed once copied.
 
         Raises:
             TypeError: For a wrong argument count, argument types, or

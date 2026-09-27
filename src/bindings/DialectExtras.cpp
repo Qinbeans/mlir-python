@@ -6,7 +6,10 @@
 // induction variable), and the helpers name the blocks users fill in.
 #include "DialectSupport.h"
 
+#include <mlir/Dialect/Async/IR/Async.h>
+#include <mlir/Dialect/EmitC/IR/EmitC.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/Dialect/IRDL/IRDLLoading.h>
 #include <mlir/Dialect/LLVMIR/LLVMDialect.h>
 #include <mlir/Dialect/LLVMIR/LLVMTypes.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
@@ -42,6 +45,16 @@ struct PyLLVMArrayType : PyType {};
 struct PyLLVMStructType : PyType {};
 struct PyLLVMFunctionType : PyType {};
 struct PyLLVMVoidType : PyType {};
+struct PyAsyncTokenType : PyType {};
+struct PyAsyncValueType : PyType {};
+struct PyAsyncGroupType : PyType {};
+struct PyEmitCOpaqueType : PyType {};
+struct PyEmitCPointerType : PyType {};
+struct PyEmitCArrayType : PyShapedType {};
+struct PyEmitCLValueType : PyType {};
+struct PyEmitCSizeTType : PyType {};
+struct PyEmitCSignedSizeTType : PyType {};
+struct PyEmitCPtrDiffTType : PyType {};
 
 /// LLVM types can only be created once the dialect is loaded (MLIR aborts
 /// otherwise), so every constructor calls this first.
@@ -284,8 +297,223 @@ void completeWhile(mlir::Operation *op) {
 
 } // namespace
 
+/// Loads the async dialect, needed before creating its types.
+const ContextHandle &withAsyncDialect(const ContextHandle &context) {
+  context->context.getOrLoadDialect<mlir::async::AsyncDialect>();
+  return context;
+}
+
+void bindAsyncTypes(nb::module_ asyncModule) {
+  using namespace nb::literals;
+  registerTypeClass<PyAsyncTokenType, mlir::async::TokenType>();
+  registerTypeClass<PyAsyncValueType, mlir::async::ValueType>();
+  registerTypeClass<PyAsyncGroupType, mlir::async::GroupType>();
+
+  nb::class_<PyAsyncTokenType, PyType>(
+      asyncModule, "TokenType",
+      "``!async.token``: completion of an asynchronous task, without a value.")
+      .def(nb::new_([](std::optional<PyContext> context) {
+             ContextHandle state = withAsyncDialect(resolveContext(context));
+             return typeHandle<PyAsyncTokenType>(
+                 state, mlir::async::TokenType::get(&state->context));
+           }),
+           nb::kw_only(), "context"_a = nb::none(), "Create ``!async.token``.");
+
+  nb::class_<PyAsyncValueType, PyType>(
+      asyncModule, "ValueType",
+      "``!async.value<T>``: a ``T`` an asynchronous task will produce.")
+      .def(nb::new_([](const PyType &valueType) {
+             withAsyncDialect(valueType.context);
+             return typeHandle<PyAsyncValueType>(
+                 valueType.context, mlir::async::ValueType::get(valueType.type));
+           }),
+           "value_type"_a, "Create ``!async.value<value_type>``.")
+      .def_prop_ro(
+          "value_type",
+          [](const PyAsyncValueType &self) {
+            return wrapType(self.context,
+                            llvm::cast<mlir::async::ValueType>(self.type).getValueType());
+          },
+          "The type of the value.");
+
+  nb::class_<PyAsyncGroupType, PyType>(
+      asyncModule, "GroupType",
+      "``!async.group``: a set of tokens to await together.")
+      .def(nb::new_([](std::optional<PyContext> context) {
+             ContextHandle state = withAsyncDialect(resolveContext(context));
+             return typeHandle<PyAsyncGroupType>(
+                 state, mlir::async::GroupType::get(&state->context));
+           }),
+           nb::kw_only(), "context"_a = nb::none(), "Create ``!async.group``.");
+}
+
+/// Adds the body of an `async.execute` created without one, as its C++
+/// builder does: one argument per operand (async values unwrapped), and
+/// `async.yield` when the task produces no values.
+void completeExecute(mlir::Operation *op) {
+  auto execute = llvm::cast<mlir::async::ExecuteOp>(op);
+  if (!execute.getBodyRegion().empty())
+    return;
+  llvm::SmallVector<mlir::Type> types;
+  for (mlir::Value operand : execute.getBodyOperands()) {
+    auto value = llvm::dyn_cast<mlir::async::ValueType>(operand.getType());
+    types.push_back(value ? value.getValueType() : operand.getType());
+  }
+  mlir::Block *body = appendBlock(execute.getBodyRegion(), types, op->getLoc());
+  if (execute.getBodyResults().empty()) {
+    mlir::OpBuilder builder = mlir::OpBuilder::atBlockEnd(body);
+    mlir::async::YieldOp::create(builder, op->getLoc(), mlir::ValueRange());
+  }
+}
+
+void bindIRDL(nb::module_ irdlModule) {
+  using namespace nb::literals;
+  irdlModule.def(
+      "load_dialects",
+      [](const PyModule &module) {
+        auto op = llvm::cast<mlir::ModuleOp>(get(module));
+        DiagnosticCapture capture(op->getContext());
+        if (mlir::failed(mlir::irdl::loadDialects(op)))
+          capture.raise("loading the IRDL dialect definitions failed");
+      },
+      "module"_a,
+      "Define the dialects that ``module`` describes with ``irdl.dialect``\n"
+      "operations, in ``module``'s context. Their operations, types, and\n"
+      "attributes can then be created (``Operation.create``, ``Type.parse``)\n"
+      "and are verified against the IRDL constraints. See\n"
+      "``mlir_python.irdl`` for declaring dialects as Python classes.\n\n"
+      "Raises:\n"
+      "    MLIRError: If a definition is invalid or a dialect of that name\n"
+      "        is already loaded.");
+}
+
+/// Loads the EmitC dialect, needed before creating its types.
+const ContextHandle &withEmitCDialect(const ContextHandle &context) {
+  context->context.getOrLoadDialect<mlir::emitc::EmitCDialect>();
+  return context;
+}
+
+/// Binds an EmitC type without parameters (`!emitc.size_t`, ...).
+template <typename Py, typename T>
+void bindEmitCKeywordType(nb::module_ emitcModule, const char *name,
+                          const char *doc, const char *createDoc) {
+  using namespace nb::literals;
+  registerTypeClass<Py, T>();
+  nb::class_<Py, PyType>(emitcModule, name, doc)
+      .def(nb::new_([](std::optional<PyContext> context) {
+             ContextHandle state = withEmitCDialect(resolveContext(context));
+             return typeHandle<Py>(state, T::get(&state->context));
+           }),
+           nb::kw_only(), "context"_a = nb::none(), createDoc);
+}
+
+void bindEmitCTypes(nb::module_ emitcModule) {
+  using namespace nb::literals;
+  registerTypeClass<PyEmitCOpaqueType, mlir::emitc::OpaqueType>();
+  registerTypeClass<PyEmitCPointerType, mlir::emitc::PointerType>();
+  registerTypeClass<PyEmitCArrayType, mlir::emitc::ArrayType>();
+  registerTypeClass<PyEmitCLValueType, mlir::emitc::LValueType>();
+
+  nb::class_<PyEmitCOpaqueType, PyType>(
+      emitcModule, "OpaqueType",
+      "``!emitc.opaque<\"T\">``: a C or C++ type spelled out as text, e.g.\n"
+      "``OpaqueType(\"FILE\")`` or ``OpaqueType(\"std::vector<int>\")``.\n"
+      "Pointers are ``PointerType``s: ``PointerType(OpaqueType(\"FILE\"))``.")
+      .def(nb::new_([](const std::string &value, std::optional<PyContext> context) {
+             ContextHandle state = withEmitCDialect(resolveContext(context));
+             return typeHandle<PyEmitCOpaqueType>(
+                 state, checkedType<mlir::emitc::OpaqueType>(
+                            state, "EmitC opaque type", &state->context,
+                            llvm::StringRef(value)));
+           }),
+           "value"_a, nb::kw_only(), "context"_a = nb::none(),
+           "Create ``!emitc.opaque<\"value\">``.")
+      .def_prop_ro(
+          "value",
+          [](const PyEmitCOpaqueType &self) {
+            return llvm::cast<mlir::emitc::OpaqueType>(self.type).getValue().str();
+          },
+          "The type as written in C or C++.");
+
+  nb::class_<PyEmitCPointerType, PyType>(
+      emitcModule, "PointerType", "``!emitc.ptr<T>``: a C pointer to ``T``.")
+      .def(nb::new_([](const PyType &pointee) {
+             withEmitCDialect(pointee.context);
+             return typeHandle<PyEmitCPointerType>(
+                 pointee.context,
+                 checkedType<mlir::emitc::PointerType>(
+                     pointee.context, "EmitC pointer type", pointee.type));
+           }),
+           "pointee"_a, "Create ``!emitc.ptr<pointee>``.")
+      .def_prop_ro(
+          "pointee",
+          [](const PyEmitCPointerType &self) {
+            return wrapType(self.context,
+                            llvm::cast<mlir::emitc::PointerType>(self.type).getPointee());
+          },
+          "The type pointed to.");
+
+  nb::class_<PyEmitCArrayType, PyShapedType>(
+      emitcModule, "ArrayType",
+      "``!emitc.array<NxMxT>``: a C array with static sizes, e.g. what a\n"
+      "``memref<4xf32>`` becomes.")
+      .def(nb::new_([](const std::vector<int64_t> &shape, const PyType &element) {
+             withEmitCDialect(element.context);
+             return typeHandle<PyEmitCArrayType>(
+                 element.context,
+                 checkedType<mlir::emitc::ArrayType>(element.context, "EmitC array type",
+                                                     shape, element.type));
+           }),
+           "shape"_a, "element_type"_a,
+           "Create ``!emitc.array<shape x element_type>``.");
+
+  nb::class_<PyEmitCLValueType, PyType>(
+      emitcModule, "LValueType",
+      "``!emitc.lvalue<T>``: an assignable ``T`` (a variable), read with\n"
+      "``emitc.load`` and written with ``emitc.assign``.")
+      .def(nb::new_([](const PyType &valueType) {
+             withEmitCDialect(valueType.context);
+             return typeHandle<PyEmitCLValueType>(
+                 valueType.context,
+                 checkedType<mlir::emitc::LValueType>(
+                     valueType.context, "EmitC lvalue type", valueType.type));
+           }),
+           "value_type"_a, "Create ``!emitc.lvalue<value_type>``.")
+      .def_prop_ro(
+          "value_type",
+          [](const PyEmitCLValueType &self) {
+            return wrapType(self.context,
+                            llvm::cast<mlir::emitc::LValueType>(self.type).getValueType());
+          },
+          "The type of the value held.");
+
+  bindEmitCKeywordType<PyEmitCSizeTType, mlir::emitc::SizeTType>(
+      emitcModule, "SizeTType", "``!emitc.size_t``: C's ``size_t``.",
+      "Create ``!emitc.size_t``.");
+  bindEmitCKeywordType<PyEmitCSignedSizeTType, mlir::emitc::SignedSizeTType>(
+      emitcModule, "SignedSizeTType",
+      "``!emitc.ssize_t``: POSIX's ``ssize_t`` (not C99).",
+      "Create ``!emitc.ssize_t``.");
+  bindEmitCKeywordType<PyEmitCPtrDiffTType, mlir::emitc::PtrDiffTType>(
+      emitcModule, "PtrDiffTType", "``!emitc.ptrdiff_t``: C's ``ptrdiff_t``.",
+      "Create ``!emitc.ptrdiff_t``.");
+}
+
 void bindDialectExtras(nb::module_ &m) {
   bindLLVMTypes(nb::borrow<nb::module_>(m.attr("llvm")));
+  bindIRDL(nb::borrow<nb::module_>(m.attr("irdl")));
+  bindAsyncTypes(nb::borrow<nb::module_>(m.attr("async_dialect")));
+  bindEmitCTypes(nb::borrow<nb::module_>(m.attr("emitc")));
+  registerPostCreateHook(mlir::TypeID::get<mlir::async::ExecuteOp>(),
+                         &completeExecute);
+  addProperty(
+      m.attr("async_dialect").attr("ExecuteOp"), "body",
+      [](const PyOperation &self) {
+        return blockHandle(
+            self, &llvm::cast<mlir::async::ExecuteOp>(checkedOp(self)).getBodyRegion().front());
+      },
+      "The task body. Without results it already ends in ``async.yield``,\n"
+      "and ``InsertionPoint(body)`` inserts before it.");
   registerPostCreateHook(mlir::TypeID::get<mlir::scf::ForOp>(), &completeFor);
   registerPostCreateHook(mlir::TypeID::get<mlir::scf::IfOp>(), &completeIf);
   registerPostCreateHook(mlir::TypeID::get<mlir::scf::WhileOp>(),

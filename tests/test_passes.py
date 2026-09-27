@@ -103,7 +103,10 @@ def test_every_generated_pass_parses() -> None:
     for cls in pass_classes:
         anchor = cls.ANCHOR or ir.Operation
         ir.PassManager(anchor, [cls()])  # construction checks placement
-        ir.PassManager.parse(f"builtin.module({cls()})")  # MLIR accepts the text
+        # MLIR accepts the text (nested under its anchor operation, if any).
+        nested = cls.ANCHOR is not None and cls.ANCHOR is not ir.Module
+        text = str(ir.Nested(anchor, [cls()]) if nested else cls())
+        ir.PassManager.parse(f"builtin.module({text})")
 
 
 def test_failures_raise_mlir_error() -> None:

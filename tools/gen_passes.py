@@ -235,7 +235,7 @@ class PassGenerator:
             "import dataclasses\nimport enum\nfrom collections.abc import Sequence\n",
             "from typing import ClassVar\n\n",
             "from ._mlir_python import Operation\n",
-            "from ._passes import Nested, Pass, PassManager, PipelineElement\n",
+            "from ._passes import Nested, Pass, PassManager, PipelineElement, PythonPass\n",
         ]
         builtin = sorted(
             cls for module, cls in self.imports if module == "mlir_python" and cls
@@ -247,11 +247,15 @@ class PassGenerator:
         ):
             out.append(f"from .dialects import {module.split('.')[-1]}\n")
         out.append("\n")
-        names = ["Nested", "Pass", "PassManager", "PipelineElement"]
+        names = ["Nested", "Pass", "PassManager", "PipelineElement", "PythonPass"]
         for enum in sorted(self.enums.values(), key=lambda e: e.name):
             names.append(enum.name)
             out.append(f"\nclass {enum.name}(enum.Enum):\n")
-            out.append(docstring(f"Values of the option: {enum.description}.", "    "))
+            out.append(
+                docstring(
+                    f"Values of the option: {enum.description.rstrip('.')}.", "    "
+                )
+            )
             for python, text, _, doc in enum.members:
                 out.append(f"\n    {python} = {text!r}\n")
                 if doc:

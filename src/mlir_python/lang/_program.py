@@ -10,6 +10,7 @@ build executables.
 
 from __future__ import annotations
 
+import array
 import ast
 import atexit
 import builtins
@@ -21,16 +22,16 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import CellType
-from typing import Any, Literal, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
 from .. import _mlir_python as ir
-from .. import codegen, passes
-from .._passes import PassManager
+from .. import codegen, passes, pipelines
+from .._passes import PassManager, PipelineElement
 from ..dialects import func, llvm
 from ._abi import ExternABI, UnsupportedABI
 from ._abi import lower as lower_abi
 from ._compiler import CompileError, FunctionCompiler, Signature, Source, signature_of
-from ._types import i32
+from ._types import ScalarType, i32
 
 type Kind = Literal["function", "extern", "main"]
 
@@ -55,8 +56,36 @@ def _release_context() -> None:
 
 _MODULE_IDS = itertools.count()
 
+# Run on every compiled module. The compiler emits branches between blocks
+# (cf), which express any control flow; these passes then
+# 1. fold the SSA plumbing it emits (one block argument per live variable,
+#    sign fixes for constant divisors, ...),
+# 2. lift the branches to structured control flow (scf.while, scf.if), with
+#    break/continue/early return becoming loop-carried flags, and
+# 3. turn counted loops (for i in range(...)) into scf.for,
+# so later passes (parallelization, vectorization, bufferization) see loops.
+_STRUCTURING: list[PipelineElement] = [
+    passes.Canonicalizer(),
+    passes.CSE(),
+    passes.LiftControlFlowToSCF(),
+    passes.Canonicalizer(),  # the uplift matches only the simplified loop form
+    passes.CSE(),
+    passes.UpliftWhileToFor(),
+    passes.Canonicalizer(),
+]
 
-class Function[**P, R]:
+
+if TYPE_CHECKING:
+    # To type checkers a compiled function is a function value (``Fn``), so
+    # it passes wherever an ``Fn[[...], R]`` or a ``ptr`` is expected.
+    from .types import Fn as _FunctionValue
+else:
+
+    class _FunctionValue[**P, R]:
+        pass
+
+
+class Function[**P, R](_FunctionValue[P, R]):
     """A function of a ``Module``, created by ``@module.function``,
     ``@module.extern``, or ``@program.main``.
 
@@ -118,6 +147,9 @@ class _Build:
     externs: dict[str, ExternABI]  # C functions, called through llvm.call
     strings: dict[str, llvm.GlobalOp]
     imports: dict[str, Module] = field(default_factory=dict)  # symbol -> module
+    # C functions the compiled code itself calls (e.g. to report a failed
+    # check), declared once per module.
+    runtime: dict[str, llvm.FunctionType] = field(default_factory=dict)
 
 
 class Module:
@@ -246,7 +278,8 @@ class Module:
 
     def linked(self) -> ir.Module:
         """This module and everything it imports, transitively, linked into
-        one MLIR module (what runs and gets built).
+        one MLIR module (what runs and gets built), with frees inserted for
+        arrays (buffer deallocation sees the whole program).
 
         Raises:
             codegen.LinkError: If two modules define the same symbol.
@@ -254,7 +287,10 @@ class Module:
         modules = self._closure()
         key = tuple(m._version for m in modules)
         if self._linked is None or self._linked[0] != key:
-            self._linked = (key, _link(modules))
+            with _context():
+                linked = _link(modules)
+                PassManager(ir.Module, pipelines.buffer_deallocation()).run(linked)
+            self._linked = (key, linked)
         return self._linked[1]
 
     def llvm_ir(
@@ -330,9 +366,7 @@ class Module:
                     sources[name],
                 ).compile()
         mlir.verify()
-        # Fold the SSA plumbing the compiler emits (one block argument per
-        # live variable, sign fixes for constant divisors, ...).
-        PassManager(ir.Module, [passes.Canonicalizer(), passes.CSE()]).run(mlir)
+        PassManager(ir.Module, _STRUCTURING).run(mlir)
         # The passes rewrote the module, so earlier handles are stale; look the
         # functions up again.
         state.ops = {
@@ -403,10 +437,28 @@ class Module:
             for op in linked.body.operations
             if isinstance(op, func.FuncOp) and op.sym_name == function.name
         )
-        arguments = cast(Sequence[codegen.Argument], args)  # checked by the JIT
-        result = self._compiled[1].function(target)(*arguments)
-        if function.kind == "main" and not state.signatures[function.name].results:
+        buffers = [
+            _to_buffer(arg, kind) if kind.kind == "array" else arg
+            for arg, (_, kind) in zip(args, signature.params, strict=False)
+        ]
+        arguments = cast(Sequence[codegen.Argument], buffers)  # checked by the JIT
+        # Arrays a function returns were allocated for its caller (buffer
+        # deallocation guarantees it), so they are freed once copied.
+        compiled = self._compiled[1].function(target, owned_results=True)
+        result = compiled(*arguments)
+        # Arrays are mutable, as lists are: write changes back to lists.
+        for arg, buffer in zip(args, buffers, strict=False):
+            if isinstance(arg, list) and buffer is not arg:
+                arg[:] = cast(memoryview, buffer).tolist()
+        if function.kind == "main" and not signature.results:
             return None
+        if signature.returns_tuple and isinstance(result, tuple):
+            return tuple(
+                _from_buffer(item, kind)
+                for item, kind in zip(result, signature.results, strict=True)
+            )
+        if len(signature.results) == 1:
+            return _from_buffer(result, signature.results[0])
         return result
 
     # -- used by the function compiler ------------------------------------------
@@ -468,6 +520,30 @@ class Module:
                 name = f".str.m{self._id}.{len(state.strings)}"
                 state.strings[text] = llvm.string_constant(name, text)
         return llvm.address_of(state.strings[text])
+
+    def runtime_function(self, name: str, function_type: llvm.FunctionType) -> None:
+        """Declares the C function ``name``, which compiled code calls on its
+        own (``write`` and ``abort`` to report a failed check).
+
+        Raises:
+            CompileError: If the module declares ``name`` as an extern of
+                another type.
+        """
+        state = self._build_state
+        assert state is not None
+        if name in state.runtime:
+            return
+        extern = state.externs.get(name)
+        if extern is not None:
+            if extern.function_type != function_type:
+                raise CompileError(
+                    f"'{name}' is declared as an extern of type {extern.function_type}, "
+                    f"but compiled code needs it as {function_type}"
+                )
+        else:
+            with ir.InsertionPoint(state.mlir.body), ir.Location.unknown():
+                llvm.LLVMFuncOp(name, function_type)
+        state.runtime[name] = function_type
 
     def resolve_global(
         self,
@@ -631,6 +707,43 @@ def _link(modules: list[Module]) -> ir.Module:
                 linked.body.append(op.clone())
         linked.verify()
         return linked
+
+
+def _to_buffer(value: object, kind: ScalarType) -> object:
+    """A Python list passed as an ``Array[T]``, as a buffer of ``T`` items
+    (other buffers, such as NumPy arrays, pass as they are)."""
+    if not isinstance(value, list):
+        return value
+    element = kind.element
+    assert element is not None
+    if element.kind == "bool":
+        buffer = memoryview(bytearray(len(value))).cast("?")
+        for index, item in enumerate(value):
+            buffer[index] = bool(item)
+        return buffer
+    if element.kind == "float":
+        code = "f" if element.bits == 32 else "d"
+    else:
+        code = {8: "b", 16: "h", 32: "i", 64: "q"}[element.bits]
+        if element.kind == "uint":
+            code = code.upper()
+    try:
+        return memoryview(array.array(code, value))
+    except (TypeError, OverflowError) as error:
+        raise type(error)(f"cannot pass the list as {kind.name}: {error}") from None
+
+
+def _from_buffer(value: object, kind: ScalarType) -> object:
+    """An ``Array[T]`` result as a Python list."""
+    if kind.kind != "array" or not isinstance(value, memoryview):
+        return value
+    items = value.tolist()
+    element = kind.element
+    if element is not None and element.kind == "uint":
+        # Compiled integers are signless and come back signed; reinterpret.
+        mask = (1 << element.bits) - 1
+        return [item & mask for item in items]
+    return items
 
 
 def _check_externs_resolve(modules: list[Module]) -> None:

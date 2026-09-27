@@ -499,7 +499,7 @@ def test_pointer_errors(tmp_path: Path) -> None:
     error = compile_error(
         "@program.function\ndef f(a: i32) -> i32:\n    return a[0]\n", tmp_path
     )
-    assert "only pointers (Ptr[T]) can be indexed" in error.msg
+    assert "only arrays and pointers (Ptr[T]) can be indexed" in error.msg
     error = compile_error(
         "@program.function\ndef f(p: ptr) -> i32:\n    return p[0]\n", tmp_path
     )

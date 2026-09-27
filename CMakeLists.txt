@@ -55,13 +55,18 @@ set(MLIR_PYTHON_INCLUDE_DIRS
 #-------------------------------------------------------------------------------
 set(MLIR_PYTHON_DIALECTS
     "arith|Arith/IR/ArithOps.td|mlir/Dialect/Arith/IR/Arith.h|::mlir::arith"
+    "async|Async/IR/AsyncOps.td|mlir/Dialect/Async/IR/Async.h|::mlir::async"
+    "bufferization|Bufferization/IR/BufferizationOps.td|mlir/Dialect/Bufferization/IR/Bufferization.h|::mlir::bufferization"
     "cf|ControlFlow/IR/ControlFlowOps.td|mlir/Dialect/ControlFlow/IR/ControlFlowOps.h|::mlir::cf"
+    "emitc|EmitC/IR/EmitC.td|mlir/Dialect/EmitC/IR/EmitC.h|::mlir::emitc"
     "func|Func/IR/FuncOps.td|mlir/Dialect/Func/IR/FuncOps.h|::mlir::func"
+    "irdl|IRDL/IR/IRDLOps.td|mlir/Dialect/IRDL/IR/IRDL.h|::mlir::irdl"
     "llvm|LLVMIR/LLVMOps.td|mlir/Dialect/LLVMIR/LLVMDialect.h|::mlir::LLVM"
     "math|Math/IR/MathOps.td|mlir/Dialect/Math/IR/Math.h|::mlir::math"
     "memref|MemRef/IR/MemRefOps.td|mlir/Dialect/MemRef/IR/MemRef.h|::mlir::memref"
     "scf|SCF/IR/SCFOps.td|mlir/Dialect/SCF/IR/SCF.h|::mlir::scf"
     "tensor|Tensor/IR/TensorOps.td|mlir/Dialect/Tensor/IR/Tensor.h|::mlir::tensor"
+    "vector|Vector/IR/VectorOps.td|mlir/Dialect/Vector/IR/VectorOps.h|::mlir::vector"
 )
 if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[3-6]86)$")
     set(MLIR_PYTHON_NATIVE_ARCH X86)
@@ -77,38 +82,75 @@ set(MLIR_PYTHON_MLIR_LIBRARIES
     LLVM${MLIR_PYTHON_NATIVE_ARCH}Info
     LLVMPasses
     MLIRArithDialect
+    MLIRArithTransforms
+    MLIRAsyncDialect
+    MLIRAsyncToLLVM
+    MLIRAsyncTransforms
+    MLIRBufferizationDialect
+    MLIRBufferizationPipelines
+    MLIRBufferizationToMemRef
+    MLIRBufferizationTransforms
+    MLIRArithToEmitC
     MLIRArithToLLVM
     MLIRBuiltinToLLVMIRTranslation
+    MLIRComplexToLLVM
     MLIRControlFlowToLLVM
+    MLIRControlFlowToSCF
+    MLIRConvertToEmitC
     MLIRConvertToLLVMPass
+    MLIREmitCDialect
+    MLIREmitCTransforms
     MLIRExecutionEngine
     MLIRExecutionEngineUtils
+    MLIRFuncToEmitC
     MLIRFuncToLLVM
     MLIRLLVMDialect
     MLIRLLVMToLLVMIRTranslation
+    MLIRMathToEmitC
     MLIRMathToLLVM
+    MLIRMemRefToEmitC
     MLIRMemRefToLLVM
     MLIRReconcileUnrealizedCasts
     MLIRSCFToControlFlow
+    MLIRSCFToEmitC
+    MLIRTargetCpp
     MLIRTargetLLVMIRExport
     MLIRUBToLLVM
+    MLIRVectorToLLVM
+    MLIRVectorToLLVMPass
+    MLIRVectorToSCF
     MLIRControlFlowDialect
+    MLIRControlFlowTransforms
     MLIRFuncDialect
     MLIRFuncInlinerExtension
     MLIRInferTypeOpInterface
+    MLIRIRDL
     MLIRIR
     MLIRMathDialect
     MLIRMemRefDialect
+    MLIRMemRefTransforms
     MLIRParser
     MLIRPass
     MLIRSCFDialect
+    MLIRSCFTransforms
     MLIRTensorDialect
+    MLIRTensorTransforms
     MLIRTransforms
+    MLIRVectorDialect
+    MLIRVectorTransforms
 )
+
+# LLVM is built without RTTI, so classes deriving from its classes (passes)
+# must be too; the rest of the extension keeps RTTI for nanobind.
+if(NOT LLVM_ENABLE_RTTI AND NOT MSVC)
+    set_source_files_properties(src/bindings/ProjectPasses.cpp
+        PROPERTIES COMPILE_OPTIONS -fno-rtti)
+endif()
 
 # Reports facts about the compiled operations that ODS records leave implicit.
 add_executable(mlir-python-introspect
     tools/introspect.cpp
+    src/bindings/ProjectPasses.cpp
     src/bindings/Registration.cpp
 )
 target_compile_features(mlir-python-introspect PRIVATE cxx_std_17)
@@ -139,7 +181,14 @@ foreach(entry IN LISTS MLIR_PYTHON_DIALECTS)
     set(td_path ${MLIR_SOURCE_DIR}/include/mlir/Dialect/${td})
     set(records ${MLIR_PYTHON_GENERATED_DIR}/${name}.json)
     set(cpp ${MLIR_PYTHON_GENERATED_DIR}/${name}.cpp)
-    set(py ${MLIR_PYTHON_PACKAGE_DIR}/dialects/${name}.py)
+    # Dialects named like Python keywords get modules named
+    # <name>_dialect (mlir_python.dialects.async_dialect), as
+    # tools/gen_dialects.py does.
+    set(pyname ${name})
+    if(name STREQUAL "async")
+        set(pyname async_dialect)
+    endif()
+    set(py ${MLIR_PYTHON_PACKAGE_DIR}/dialects/${pyname}.py)
     set(classes ${MLIR_PYTHON_GENERATED_DIR}/${name}.classes.json)
     add_custom_command(
         OUTPUT ${records}
@@ -166,7 +215,7 @@ foreach(entry IN LISTS MLIR_PYTHON_DIALECTS)
     )
     list(APPEND MLIR_PYTHON_GENERATED_SOURCES ${cpp})
     list(APPEND MLIR_PYTHON_CLASS_MAPS ${classes})
-    list(APPEND MLIR_PYTHON_GENERATED_MODULES ${name})
+    list(APPEND MLIR_PYTHON_GENERATED_MODULES ${pyname})
     string(APPEND dialect_declarations "void bindDialect_${name}(nb::module_ &parent);\n")
     string(APPEND dialect_calls "  bindDialect_${name}(m);\n")
 endforeach()
@@ -180,6 +229,11 @@ endforeach()
 #-------------------------------------------------------------------------------
 set(MLIR_PYTHON_PASS_DEFINITIONS
     Conversion/Passes.td
+    Dialect/Async/Passes.td
+    Dialect/Bufferization/Transforms/Passes.td
+    Dialect/EmitC/Transforms/Passes.td
+    Dialect/MemRef/Transforms/Passes.td
+    Dialect/Vector/Transforms/Passes.td
     Transforms/Passes.td
 )
 set(pass_records "")
@@ -198,6 +252,19 @@ foreach(td IN LISTS MLIR_PYTHON_PASS_DEFINITIONS)
     )
     list(APPEND pass_records ${records})
 endforeach()
+# Passes mlir-python defines (implemented in src/bindings/ProjectPasses.cpp).
+set(project_pass_td ${CMAKE_CURRENT_SOURCE_DIR}/src/bindings/ProjectPasses.td)
+set(records ${MLIR_PYTHON_GENERATED_DIR}/passes_project.json)
+add_custom_command(
+    OUTPUT ${records}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${MLIR_PYTHON_GENERATED_DIR}
+    COMMAND llvm-tblgen --dump-json -I ${MLIR_SOURCE_DIR}/include ${project_pass_td}
+        -o ${records}
+    DEPENDS llvm-tblgen ${project_pass_td}
+    COMMENT "Dumping pass records for mlir-python's own passes"
+    VERBATIM
+)
+list(APPEND pass_records ${records})
 add_custom_command(
     OUTPUT ${MLIR_PYTHON_INTROSPECTION}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${MLIR_PYTHON_GENERATED_DIR}
@@ -246,6 +313,7 @@ nanobind_add_module(_mlir_python STABLE_ABI
     src/bindings/IR.cpp
     src/bindings/Module.cpp
     src/bindings/Passes.cpp
+    src/bindings/ProjectPasses.cpp
     src/bindings/Registration.cpp
     src/bindings/Types.cpp
     ${MLIR_PYTHON_GENERATED_DIR}/BindDialects.cpp
@@ -260,6 +328,17 @@ target_link_libraries(_mlir_python PRIVATE ${MLIR_PYTHON_MLIR_LIBRARIES})
 
 install(TARGETS _mlir_python LIBRARY DESTINATION mlir_python)
 
+# MLIR's reference runtime for the async dialect (thread pool, tokens,
+# values, groups), shipped next to the extension. Compiled async code calls
+# it through a C API, so another implementation can replace it (see
+# mlir_python.codegen.async_runtime).
+# Unversioned (libmlir_async_runtime.so), since wheels cannot hold the
+# versioned name's symlinks.
+set_property(TARGET mlir_async_runtime PROPERTY VERSION)
+set_property(TARGET mlir_async_runtime PROPERTY SOVERSION)
+add_dependencies(_mlir_python mlir_async_runtime)
+install(TARGETS mlir_async_runtime LIBRARY DESTINATION mlir_python)
+
 # Development builds place the module next to the Python sources, so
 # `import mlir_python` works from src/, and regenerate its type stubs.
 option(MLIR_PYTHON_INPLACE
@@ -268,6 +347,8 @@ if(MLIR_PYTHON_INPLACE)
     add_custom_command(TARGET _mlir_python POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:_mlir_python> ${MLIR_PYTHON_PACKAGE_DIR}/
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:mlir_async_runtime> ${MLIR_PYTHON_PACKAGE_DIR}/
         COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/register_venv.cmake
         VERBATIM

@@ -30,13 +30,18 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from .. import _mlir_python as ir
-from ..dialects import arith, cf, func, llvm, math
+from ..dialects import arith, cf, func, llvm, math, memref, scf
 from ._types import (
+    ARRAY_ELEMENT_KINDS,
+    Array,
+    ArrayType,
     Fn,
     FnType,
     Ptr,
     ScalarType,
     StructType,
+    array,
+    array_of,
     boolean,
     cstr,
     f64,
@@ -328,20 +333,28 @@ class GraphBuilder:
                 node.target, "the loop variable must be a plain name"
             )
         call = node.iter
-        if not (
+        k = next(self.hidden)
+        counter, limit, stride = f"__for{k}_i", f"__for{k}_stop", f"__for{k}_step"
+        sequence = f"__for{k}_items"
+        is_range = (
             isinstance(call, ast.Call)
             and isinstance(call.func, ast.Name)
             and call.func.id == "range"
             and not call.keywords
             and 1 <= len(call.args) <= 3
-        ):
-            raise self.source.error(node.iter, "for loops iterate over range(...) only")
-        args = call.args
-        start = args[0] if len(args) > 1 else ast.Constant(0)
-        stop = args[1] if len(args) > 1 else args[0]
-        step = args[2] if len(args) == 3 else ast.Constant(1)
-        k = next(self.hidden)
-        counter, limit, stride = f"__for{k}_i", f"__for{k}_stop", f"__for{k}_step"
+        )
+        if is_range:
+            assert isinstance(call, ast.Call)
+            args = call.args
+            start = args[0] if len(args) > 1 else ast.Constant(0)
+            stop = args[1] if len(args) > 1 else args[0]
+            step = args[2] if len(args) == 3 else ast.Constant(1)
+        else:
+            # `for x in xs`: evaluate xs once, then index it from 0 to len(xs).
+            start, step = ast.Constant(0), ast.Constant(1)
+            stop = ast.Call(
+                ast.Name("len", ast.Load()), [ast.Name(sequence, ast.Load())]
+            )
 
         def located[T: ast.AST](new: T, like: ast.AST = node) -> T:
             ast.copy_location(new, like)
@@ -356,6 +369,9 @@ class GraphBuilder:
                 like,
             )
 
+        if not is_range:
+            block.statements.append(store(sequence, call, call))
+            stop = located(stop, call)
         block.statements += [store(counter, start, call), store(limit, stop, call)]
         literal_step = literal_int(step)
         if literal_step == 0:
@@ -394,7 +410,14 @@ class GraphBuilder:
         header, body, latch, exit_block = Block(), Block(), Block(), Block()
         block.terminator = Jump(header)
         header.terminator = Branch(test, body, exit_block)
-        body.statements.append(store(node.target.id, name(counter), node.target))
+        element: ast.expr = (
+            name(counter)
+            if is_range
+            else located(
+                ast.Subscript(name(sequence, call), name(counter), ast.Load()), call
+            )
+        )
+        body.statements.append(store(node.target.id, element, node.target))
         end = self.walk(node.body, body, Loop(exit_block, latch))
         if end is not None:
             end.terminator = Jump(latch)
@@ -471,6 +494,11 @@ def type_from_expression(
     if isinstance(node, ast.Subscript) and static_object(node.value, resolve) is Ptr:
         element = type_from_expression(node.slice, resolve)
         return pointer_to(element) if element is not None else None
+    if isinstance(node, ast.Subscript) and static_object(node.value, resolve) is Array:
+        element = type_from_expression(node.slice, resolve)
+        if element is None or element.kind not in ARRAY_ELEMENT_KINDS:
+            return None
+        return array_of(element)
     if isinstance(node, ast.Subscript) and static_object(node.value, resolve) is Fn:
         match node.slice:
             case ast.Tuple(elts=[ast.List(elts=param_nodes), result_node]):
@@ -678,7 +706,15 @@ class LiteralKind(enum.Enum):
     FLOAT = "float"
 
 
-type TypeFact = ScalarType | LiteralKind | None
+@dataclass(frozen=True)
+class ArrayFact:
+    """An array whose element type is still being inferred: the key of its
+    element's type (so ``[0, 0]`` becomes ``Array[i32]`` if used as one)."""
+
+    element: object
+
+
+type TypeFact = ScalarType | LiteralKind | ArrayFact | None
 INT_LITERAL = LiteralKind.INT
 FLOAT_LITERAL = LiteralKind.FLOAT
 
@@ -694,6 +730,7 @@ class TypeInference:
         self.parent: dict[object, object] = {}
         self.fact: dict[object, TypeFact] = {}
         self.counter = itertools.count()
+        self.displays: dict[int, object] = {}  # id of a list display -> its key
 
     def fresh(self, fact: TypeFact) -> object:
         key = ("expr", next(self.counter))
@@ -721,12 +758,13 @@ class TypeInference:
         self.parent[rb] = ra
         self.fact[ra] = self.merge(self.fact[ra], self.fact[rb])
 
-    @staticmethod
-    def merge(a: TypeFact, b: TypeFact) -> TypeFact:
+    def merge(self, a: TypeFact, b: TypeFact) -> TypeFact:
         if a is None:
             return b
         if b is None or a == b:
             return a
+        if isinstance(a, ArrayFact) or isinstance(b, ArrayFact):
+            return self.merge_arrays(a, b)
         if isinstance(a, ScalarType) and isinstance(b, ScalarType):
             return a  # a conflict; emission reports it where it happens
         if isinstance(a, ScalarType):
@@ -735,12 +773,28 @@ class TypeInference:
             return b
         return FLOAT_LITERAL  # an int literal meets a float literal
 
+    def merge_arrays(self, a: TypeFact, b: TypeFact) -> TypeFact:
+        """Unifies the element types of two arrays; a known array type wins."""
+        elements = []
+        for fact in (a, b):
+            if isinstance(fact, ArrayFact):
+                elements.append(fact.element)
+            elif isinstance(fact, ArrayType) and fact.element is not None:
+                elements.append(self.fresh(fact.element))
+            else:
+                return a  # a conflict; emission reports it where it happens
+        self.union(elements[0], elements[1])
+        return b if isinstance(b, ArrayType) else a
+
     def result(self, key: object) -> ScalarType | None:
         fact = self.fact[self.find(key)]
         if fact == INT_LITERAL:
             return i64
         if fact == FLOAT_LITERAL:
             return f64
+        if isinstance(fact, ArrayFact):
+            element = self.result(fact.element)
+            return array_of(element) if element is not None else None
         return fact if isinstance(fact, ScalarType) else None
 
     # -- constraints ------------------------------------------------------------
@@ -826,7 +880,14 @@ class TypeInference:
                 return self.fresh(type_from_expression(kind_node, self.resolve))
             case ast.Subscript(value=base, slice=index):
                 self.single(index)
-                return self.fresh(self.element_of(self.single(base)))
+                return self.element_of(self.single(base))
+            case ast.List(elts=elements):
+                element = self.fresh(None)
+                for item in elements:
+                    self.union(element, self.single(item))
+                key = self.fresh(ArrayFact(element))
+                self.displays[id(node)] = key
+                return key
             case _:
                 return self.fresh(None)
 
@@ -842,7 +903,14 @@ class TypeInference:
         if target is stack and args:
             element = type_from_expression(args[0], self.resolve)
             return self.fresh(pointer_to(element) if element is not None else None)
+        if target is array and args:
+            element = type_from_expression(args[0], self.resolve)
+            for arg in args[1:]:
+                self.single(arg)
+            return self.fresh(array_of(element) if element is not None else None)
         keys = [self.single(arg) for arg in args]
+        if target is builtins.len:
+            return self.fresh(i64)
         kind = scalar_type(target)
         if isinstance(kind, StructType):
             named = {k.arg: self.single(k.value) for k in keywords if k.arg}
@@ -870,9 +938,14 @@ class TypeInference:
             return keys[0]
         return self.fresh(None)
 
-    def element_of(self, pointer: object) -> ScalarType | None:
-        fact = self.fact[self.find(pointer)]
-        return fact.element if isinstance(fact, ScalarType) else None
+    def element_of(self, container: object) -> object:
+        """The key of the element type of a pointer or array."""
+        fact = self.fact[self.find(container)]
+        if isinstance(fact, ArrayFact):
+            return fact.element
+        if isinstance(fact, ScalarType) and fact.element is not None:
+            return self.fresh(fact.element)
+        return self.fresh(None)
 
     def field_of(self, value: object, name: str) -> ScalarType | None:
         fact = self.fact[self.find(value)]
@@ -885,9 +958,7 @@ class TypeInference:
             self.union(value, self.single(target))
             return
         if isinstance(target, ast.Subscript) and not isinstance(value, list):
-            element = self.element_of(self.single(target.value))
-            if element is not None:
-                self.union(value, self.fresh(element))
+            self.union(value, self.element_of(self.single(target.value)))
             return
         if isinstance(target, ast.Name):
             if not isinstance(value, list):
@@ -920,9 +991,9 @@ class TypeInference:
                     self.union(self.variable(name), self.fresh(kind))
                     if value is not None:
                         literal = self.single(value)
-                        if self.fact[self.find(literal)] in (
-                            INT_LITERAL,
-                            FLOAT_LITERAL,
+                        fact = self.fact[self.find(literal)]
+                        if fact in (INT_LITERAL, FLOAT_LITERAL) or isinstance(
+                            fact, ArrayFact
                         ):
                             self.union(literal, self.fresh(kind))
                 elif value is not None:
@@ -955,6 +1026,14 @@ class TypeInference:
                 types[name] = kind
         return types
 
+    def display_types(self) -> dict[int, ScalarType]:
+        """The inferred type of each list display, by ``id`` of its node."""
+        return {
+            node: kind
+            for node, key in self.displays.items()
+            if (kind := self.result(key)) is not None
+        }
+
 
 # ---------------------------------------------------------------------------
 # Emission
@@ -979,6 +1058,7 @@ class FunctionCompiler:
         self.source = source
         self.region = op.body
         self.variable_types: dict[str, ScalarType] = dict(signature.params)
+        self.display_types: dict[int, ScalarType] = {}
         self.env: dict[str, Typed] = {}
         self.blocks: dict[int, ir.Block] = {}
         self.block_arguments: dict[int, list[str]] = {}
@@ -996,9 +1076,9 @@ class FunctionCompiler:
         self.all_assigned = params.union(
             *(assigned_names(s) for b in order for s in b.statements)
         )
-        inferred = TypeInference(self.resolve_quietly).run(
-            order, self.signature, self.all_assigned
-        )
+        inference = TypeInference(self.resolve_quietly)
+        inferred = inference.run(order, self.signature, self.all_assigned)
+        self.display_types = inference.display_types()
         for name, kind in inferred.items():
             self.variable_types.setdefault(name, kind)
         entry_block = self.op.add_entry_block()
@@ -1091,10 +1171,10 @@ class FunctionCompiler:
                 for target in targets:
                     self.assign(target, result, value)
             case ast.AugAssign(target=ast.Subscript() as target, op=op, value=value):
-                address, element = self.element_address(target)
-                current = Typed(llvm.LoadOp(element.mlir(), address).result, element)
+                element, load, store = self.element(target)
+                current = Typed(load(), element)
                 updated = self.binary(op, current, self.operand(value), node)
-                llvm.StoreOp(self.materialize(updated, element, node).value, address)
+                store(self.materialize(updated, element, node).value)
             case ast.AugAssign(target=ast.Attribute() as target, op=op, value=value):
                 current = self.operand(target)
                 updated = self.binary(op, current, self.operand(value), node)
@@ -1132,8 +1212,8 @@ class FunctionCompiler:
         if isinstance(target, ast.Subscript):
             if result is None or isinstance(result, TupleValue):
                 raise self.source.error(node, "only a single value can be stored")
-            address, element = self.element_address(target)
-            llvm.StoreOp(self.materialize(result, element, node).value, address)
+            element, _, store = self.element(target)
+            store(self.materialize(result, element, node).value)
             return
         if isinstance(target, ast.Tuple):
             if not isinstance(result, TupleValue) or len(result.items) != len(
@@ -1323,7 +1403,18 @@ class FunctionCompiler:
                 return Typed(operand.value, kind)  # any pointer passes as a ptr
             if fits_function_type(operand.type, kind):
                 return Typed(operand.value, kind)
-            if kind.kind == "struct" or operand.type.kind == "struct":
+            if (
+                operand.type.kind == "array"
+                and kind.kind == "ptr"
+                and kind.element in (None, operand.type.element)
+            ):
+                # Like a C array, an array passes as a pointer to its first
+                # element (valid while the array is).
+                return Typed(self.array_pointer(operand.value), kind)
+            if kind.kind in ("struct", "array") or operand.type.kind in (
+                "struct",
+                "array",
+            ):
                 raise self.source.error(
                     node, f"expected {kind.name}, got {operand.type.name}"
                 )
@@ -1424,8 +1515,10 @@ class FunctionCompiler:
             case ast.Call():
                 return self.call(node)
             case ast.Subscript():
-                address, element = self.element_address(node)
-                return Typed(llvm.LoadOp(element.mlir(), address).result, element)
+                element, load, _ = self.element(node)
+                return Typed(load(), element)
+            case ast.List():
+                return self.array_display(node)
             case _:
                 raise self.source.error(
                     node, f"unsupported expression ({type(node).__name__})"
@@ -1454,7 +1547,7 @@ class FunctionCompiler:
     ) -> Operand:
         symbol = SYMBOLS.get(type(op), type(op).__name__)
         for side in (left, right):
-            if isinstance(side, Typed) and side.type.kind == "struct":
+            if isinstance(side, Typed) and side.type.kind in ("struct", "array"):
                 raise self.source.error(
                     node, f"{side.type.name} values do not support {symbol}"
                 )
@@ -1646,6 +1739,10 @@ class FunctionCompiler:
             return operand.value
         if kind.kind == "struct":
             raise self.source.error(node, f"a {kind.name} is not a condition")
+        if kind.kind == "array":  # like a list: true when not empty
+            length = self.array_length(operand.value)
+            zero = arith.ConstantOp(ir.IntegerAttr(0, ir.IntegerType(64))).result
+            return arith.CmpIOp(arith.CmpIPredicate.NE, length, zero).result
         zero = self.materialize(Literal(0.0 if kind.kind == "float" else 0), kind, node)
         if kind.is_integer:
             return arith.CmpIOp(
@@ -1753,6 +1850,10 @@ class FunctionCompiler:
             return self.convert(self.operand(node.args[0]), kind, node)
         if target is stack:
             return self.allocate(node)
+        if target is array:
+            return self.make_array(node)
+        if target is builtins.len:
+            return self.length(node)
         if target is builtins.abs:
             return self.absolute(node)
         if target in (builtins.min, builtins.max):
@@ -2002,6 +2103,8 @@ class FunctionCompiler:
             raise self.source.error(
                 node, f"a {kind.name} cannot be passed as a variadic argument"
             )
+        if kind.kind == "array":
+            return self.array_pointer(operand.value)
         if kind.kind == "bool" or (kind.is_integer and kind.bits < 32):
             return self.convert(operand, i32, node).value
         if kind.kind == "float" and kind.bits < 64:
@@ -2045,6 +2148,14 @@ class FunctionCompiler:
             return Typed(resize(target_type, value).result, kind)
         if source.kind in ("ptr", "cstr", "fn") and kind.kind in ("ptr", "fn"):
             return Typed(value, kind)  # pointers are untyped in memory
+        if source.kind == "array" and kind.kind == "ptr":
+            if kind.element not in (None, source.element):
+                raise self.source.error(
+                    node, f"cannot point at {source.name}'s items as {kind.name}"
+                )
+            # ptr(xs) / Ptr[T](xs): the address of the first item, as C
+            # functions take arrays (valid while the array is).
+            return Typed(self.array_pointer(value), kind)
         raise self.source.error(node, f"cannot convert {source.name} to {kind.name}")
 
     def allocate(self, node: ast.Call) -> Typed:
@@ -2070,11 +2181,172 @@ class FunctionCompiler:
             address = llvm.AllocaOp(pointer, size, element.mlir()).result
         return Typed(address, pointer_to(element))
 
-    def element_address(self, node: ast.Subscript) -> tuple[ir.Value, ScalarType]:
-        """The address of ``p[i]`` and the element type."""
+    def element(
+        self, node: ast.Subscript
+    ) -> tuple[ScalarType, Callable[[], ir.Value], Callable[[ir.Value], None]]:
+        """``xs[i]`` or ``p[i]``: the element type, and functions loading and
+        storing the element."""
         base = self.operand(node.value)
+        if isinstance(base, Typed) and base.type.kind == "array":
+            array_value = base.value
+            element = base.type.element
+            assert element is not None
+            index = self.array_index(array_value, self.operand(node.slice), node.slice)
+
+            def load() -> ir.Value:
+                return memref.LoadOp(array_value, [index]).result
+
+            def store(value: ir.Value) -> None:
+                memref.StoreOp(value, array_value, [index])
+
+            return element, load, store
+        address, element = self.element_address(node, base)
+
+        def load_pointer() -> ir.Value:
+            return llvm.LoadOp(element.mlir(), address).result
+
+        def store_pointer(value: ir.Value) -> None:
+            llvm.StoreOp(value, address)
+
+        return element, load_pointer, store_pointer
+
+    def check(self, condition: ir.Value, message: str, node: ast.AST) -> None:
+        """Stops the program unless ``condition`` holds: writes
+        ``file:line: message`` to stderr (unbuffered, so it is never lost) and
+        aborts."""
+        line = self.source.first_line + getattr(node, "lineno", 1) - 1
+        text = f"{self.source.filename}:{line}: {message}\n"
+        true = arith.ConstantOp(ir.BoolAttr(True)).result
+        failed = arith.XOrIOp(condition, true).result
+        i32_type, i64_type = ir.IntegerType(32), ir.IntegerType(64)
+        pointer = llvm.PointerType()
+        self.program.runtime_function(
+            "write", llvm.FunctionType(i64_type, [i32_type, pointer, i64_type])
+        )
+        self.program.runtime_function("abort", llvm.FunctionType(llvm.VoidType(), []))
+        branch = scf.IfOp(failed)
+        with ir.InsertionPoint(branch.then_block):
+            stderr = arith.ConstantOp(ir.IntegerAttr(2, i32_type)).result
+            size = len(text.encode())
+            count = arith.ConstantOp(ir.IntegerAttr(size, i64_type)).result
+            message_pointer = self.program.string_pointer(text)
+            llvm.CallOp(
+                [stderr, message_pointer, count], callee="write", result_type=i64_type
+            )
+            llvm.CallOp([], callee="abort")
+
+    def array_length(self, array_value: ir.Value) -> ir.Value:
+        """``len(xs)`` as an i64."""
+        zero = arith.ConstantOp(ir.IntegerAttr(0, ir.IndexType())).result
+        size = memref.DimOp(array_value, zero).result
+        return arith.IndexCastOp(ir.IntegerType(64), size).result
+
+    def array_index(
+        self, array_value: ir.Value, index: Operand, node: ast.AST
+    ) -> ir.Value:
+        """The memref index of ``xs[index]`` with Python's meaning (negative
+        indices count from the end), stopping the program when out of range."""
+        if (isinstance(index, Typed) and not index.type.is_integer) or (
+            isinstance(index, Literal) and type(index.value) is not int
+        ):
+            raise self.source.error(node, "array indices must be integers")
+        position = self.convert(index, i64, node).value
+        length = self.array_length(array_value)
+        if not (isinstance(index, Literal) and int(index.value) >= 0):
+            zero = arith.ConstantOp(ir.IntegerAttr(0, ir.IntegerType(64))).result
+            negative = arith.CmpIOp(arith.CmpIPredicate.SLT, position, zero).result
+            from_end = arith.AddIOp(position, length).result
+            position = arith.SelectOp(negative, from_end, position).result
+        # Unsigned, a negative position is huge, so this checks both ends.
+        in_range = arith.CmpIOp(arith.CmpIPredicate.ULT, position, length).result
+        self.check(in_range, "index out of range", node)
+        return arith.IndexCastOp(ir.IndexType(), position).result
+
+    def new_array(
+        self, element: ScalarType, length: ir.Value, *, zero: bool
+    ) -> ir.Value:
+        """A heap array of ``length`` (an i64) ``element`` values, freed by
+        buffer deallocation once unused."""
+        count = arith.IndexCastOp(ir.IndexType(), length).result
+        array_value = memref.AllocOp(
+            ir.MemRefType([None], element.mlir()), [count]
+        ).memref
+        if zero:
+            start = arith.ConstantOp(ir.IntegerAttr(0, ir.IndexType())).result
+            one = arith.ConstantOp(ir.IntegerAttr(1, ir.IndexType())).result
+            empty = self.materialize(
+                Literal(False if element.kind == "bool" else 0),
+                element,
+                self.source.tree,
+            ).value
+            loop = scf.ForOp(start, count, one)
+            with ir.InsertionPoint(loop.body):
+                memref.StoreOp(empty, array_value, [loop.induction_variable])
+        return array_value
+
+    def array_display(self, node: ast.List) -> Typed:
+        """``[a, b, c]``: a new array of the elements."""
+        kind = self.display_types.get(id(node))
+        if kind is None or kind.element is None:
+            if not node.elts:
+                raise self.source.error(
+                    node, "give an empty list its type, e.g. xs: Array[i32] = []"
+                )
+            kind = array_of(self.natural_type(self.operand(node.elts[0])))
+        element = kind.element
+        assert element is not None
+        if element.kind not in ARRAY_ELEMENT_KINDS:
+            raise self.source.error(
+                node, f"arrays hold integers, floats, or bools, not {element.name}"
+            )
+        length = arith.ConstantOp(ir.IntegerAttr(len(node.elts), ir.IntegerType(64)))
+        array_value = self.new_array(element, length.result, zero=False)
+        for position, item in enumerate(node.elts):
+            value = self.materialize(self.operand(item), element, item).value
+            index = arith.ConstantOp(ir.IntegerAttr(position, ir.IndexType())).result
+            memref.StoreOp(value, array_value, [index])
+        return Typed(array_value, kind)
+
+    def make_array(self, node: ast.Call) -> Typed:
+        """``array(T, length)``: a new array of zeros."""
+        if len(node.args) != 2:
+            raise self.source.error(node, "array(T, length) takes a type and a length")
+        element = type_from_expression(node.args[0], self.resolve_quietly)
+        if element is None or element.kind not in ARRAY_ELEMENT_KINDS:
+            raise self.source.error(
+                node.args[0],
+                "array() holds integers, floats, or bools, e.g. array(i32, n)",
+            )
+        length = self.convert(self.operand(node.args[1]), i64, node.args[1]).value
+        zero = arith.ConstantOp(ir.IntegerAttr(0, ir.IntegerType(64))).result
+        valid = arith.CmpIOp(arith.CmpIPredicate.SGE, length, zero).result
+        self.check(valid, "array length must not be negative", node.args[1])
+        return Typed(self.new_array(element, length, zero=True), array_of(element))
+
+    def length(self, node: ast.Call) -> Typed:
+        if len(node.args) != 1:
+            raise self.source.error(node, "len() takes one argument")
+        value = self.operand(node.args[0])
+        if not (isinstance(value, Typed) and value.type.kind == "array"):
+            raise self.source.error(node.args[0], "len() takes an array")
+        return Typed(self.array_length(value.value), i64)
+
+    def array_pointer(self, array_value: ir.Value) -> ir.Value:
+        """A pointer to an array's first element, to pass to C."""
+        address = memref.ExtractAlignedPointerAsIndexOp(array_value).aligned_pointer
+        integer = arith.IndexCastOp(ir.IntegerType(64), address).result
+        return llvm.IntToPtrOp(llvm.PointerType(), integer).result
+
+    def element_address(
+        self, node: ast.Subscript, base: Operand | None = None
+    ) -> tuple[ir.Value, ScalarType]:
+        """The address of ``p[i]`` and the element type."""
+        if base is None:
+            base = self.operand(node.value)
         if not (isinstance(base, Typed) and base.type.kind == "ptr"):
-            raise self.source.error(node.value, "only pointers (Ptr[T]) can be indexed")
+            raise self.source.error(
+                node.value, "only arrays and pointers (Ptr[T]) can be indexed"
+            )
         element = base.type.element
         if element is None:
             raise self.source.error(
@@ -2083,7 +2355,9 @@ class FunctionCompiler:
         index = self.operand(node.slice)
         if isinstance(index, Literal) and type(index.value) is int and index.value == 0:
             return base.value, element
-        if isinstance(index, Typed) and not index.type.is_integer:
+        if (isinstance(index, Typed) and not index.type.is_integer) or (
+            isinstance(index, Literal) and type(index.value) is not int
+        ):
             raise self.source.error(node.slice, "pointer indices must be integers")
         offset = self.convert(index, i64, node.slice).value
         dynamic = -(2**31)  # LLVM::GEPOp::kDynamicIndex

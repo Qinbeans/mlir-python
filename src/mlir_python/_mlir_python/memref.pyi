@@ -431,7 +431,7 @@ class AllocOp(mlir_python._mlir_python.Operation):
         Create ``memref.alloc``: memory allocation operation.
 
         Args:
-            memref_type: Type of result ``memref``.
+            memref_type: Type of result ``memref`` (memref of any type values).
             dynamic_sizes: Operand ``dynamicSizes`` (index). Empty by default.
             symbol_operands: Operand ``symbolOperands`` (index). Empty by default.
             alignment: Attribute ``alignment`` (64-bit signless integer attribute whose value is positive and whose value is a power of two > 0). Optional.
@@ -449,7 +449,7 @@ class AllocOp(mlir_python._mlir_python.Operation):
 
     @property
     def memref(self) -> mlir_python._mlir_python.OpResult:
-        """Result ``memref``."""
+        """Result ``memref``: memref of any type values."""
 
     @property
     def alignment(self) -> int | None:
@@ -515,7 +515,7 @@ class AllocaOp(mlir_python._mlir_python.Operation):
         Create ``memref.alloca``: stack memory allocation operation.
 
         Args:
-            memref_type: Type of result ``memref``.
+            memref_type: Type of result ``memref`` (memref of any type values).
             dynamic_sizes: Operand ``dynamicSizes`` (index). Empty by default.
             symbol_operands: Operand ``symbolOperands`` (index). Empty by default.
             alignment: Attribute ``alignment`` (64-bit signless integer attribute whose value is positive and whose value is a power of two > 0). Optional.
@@ -533,7 +533,7 @@ class AllocaOp(mlir_python._mlir_python.Operation):
 
     @property
     def memref(self) -> mlir_python._mlir_python.OpResult:
-        """Result ``memref``."""
+        """Result ``memref``: memref of any type values."""
 
     @property
     def alignment(self) -> int | None:
@@ -823,14 +823,14 @@ class DeallocOp(mlir_python._mlir_python.Operation):
         Create ``memref.dealloc``: memory deallocation operation.
 
         Args:
-            memref: Operand ``memref``.
+            memref: Operand ``memref`` (ranked or unranked memref of any type values).
             location: Defaults to the current ``Location``.
             ip: Defaults to the current ``InsertionPoint``; detached without one.
         """
 
     @property
     def memref(self) -> mlir_python._mlir_python.Value:
-        """Operand ``memref``."""
+        """Operand ``memref``: ranked or unranked memref of any type values."""
 
     OPERATION_NAME: str = "memref.dealloc"
 
@@ -1648,8 +1648,8 @@ class ReallocOp(mlir_python._mlir_python.Operation):
         Create ``memref.realloc``: memory reallocation operation.
 
         Args:
-            result_type: Type of result ``result``.
-            source: Operand ``source``.
+            result_type: Type of result ``result`` (memref of any type values).
+            source: Operand ``source`` (memref of any type values).
             dynamic_result_size: Operand ``dynamicResultSize`` (index). Optional.
             alignment: Attribute ``alignment`` (64-bit signless integer attribute whose value is positive and whose value is a power of two > 0). Optional.
             location: Defaults to the current ``Location``.
@@ -1658,7 +1658,7 @@ class ReallocOp(mlir_python._mlir_python.Operation):
 
     @property
     def source(self) -> mlir_python._mlir_python.Value:
-        """Operand ``source``."""
+        """Operand ``source``: memref of any type values."""
 
     @property
     def dynamic_result_size(self) -> mlir_python._mlir_python.Value | None:
@@ -1807,7 +1807,7 @@ class ReinterpretCastOp(mlir_python._mlir_python.Operation):
 
         Args:
             result_type: Type of result ``result`` (memref of any type values).
-            source: Operand ``source``.
+            source: Operand ``source`` (ranked or unranked memref of any type values).
             static_offsets: Attribute ``static_offsets`` (i64 dense array attribute).
             static_sizes: Attribute ``static_sizes`` (i64 dense array attribute).
             static_strides: Attribute ``static_strides`` (i64 dense array attribute).
@@ -1820,7 +1820,7 @@ class ReinterpretCastOp(mlir_python._mlir_python.Operation):
 
     @property
     def source(self) -> mlir_python._mlir_python.Value:
-        """Operand ``source``."""
+        """Operand ``source``: ranked or unranked memref of any type values."""
 
     @property
     def offsets(self) -> list[mlir_python._mlir_python.Value]:

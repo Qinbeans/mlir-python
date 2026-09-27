@@ -12,5 +12,8 @@ namespace mlir_python {
 void registerLinkedDialects(mlir::DialectRegistry &registry);
 /// Registers the passes linked into the module with MLIR's global registry.
 void registerLinkedPasses();
+/// Registers the passes mlir-python defines (ProjectPasses.td); called by
+/// registerLinkedPasses.
+void registerProjectPasses();
 
 } // namespace mlir_python

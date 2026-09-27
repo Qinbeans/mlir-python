@@ -70,8 +70,10 @@ The MLIR layer underneath stays available: ``module.mlir`` is an ordinary
 from ._compiler import CompileError
 from ._program import Function, Module, Program
 from .types import (
+    Array,
     Fn,
     Ptr,
+    array,
     cstr,
     f32,
     f64,
@@ -89,12 +91,14 @@ from .types import (
 )
 
 __all__ = [
+    "Array",
     "CompileError",
     "Fn",
     "Function",
     "Module",
     "Program",
     "Ptr",
+    "array",
     "cstr",
     "f32",
     "f64",

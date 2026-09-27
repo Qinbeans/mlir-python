@@ -45,7 +45,8 @@ reads `build/dev/compile_commands.json` through `.clangd`.
 
 A wheel is self-contained: LLVM and MLIR are built from the submodule and linked
 statically into the extension, so `pip install` needs nothing else (compiling to
-executables still calls the system `cc`). Wheels use CPython's stable ABI, so one
+executables still calls the system `cc`). MLIR's async runtime ships beside the
+extension as `libmlir_async_runtime.so`. Wheels use CPython's stable ABI, so one
 wheel per platform serves Python 3.12 and later (`cp312-abi3`).
 
 ```sh
@@ -131,6 +132,14 @@ print(program)                            # the MLIR; program.llvm_ir() for LLVM
   conditional expressions, `if`/`elif`/`else`, `while`, `for i in range(...)`,
   `break`, `continue`, `return`, conversions like `i32(x)`, `abs`, `min`,
   `max`, and calls between the program's functions (recursion included).
+- Arrays: `Array[T]` (e.g. `Array[i32]`) is created with a list display
+  (`[1, 2, 3]`) or `array(f64, n)`, indexed like a list (`xs[i]`, `xs[-1]`,
+  `xs[i] = v`), measured with `len`, iterated with `for x in xs`, and passed
+  and returned. Out-of-range indices stop the program with a message, and
+  arrays are freed automatically. To type checkers an `Array[T]` is a
+  `list[T]`, so Python lists pass in and come back out through the JIT;
+  NumPy arrays and other buffers are accepted without copying. `ptr(xs)`
+  hands one to C.
 - C functions are declared with `@program.extern` and a `...` body; `*args`
   declares a variadic one such as `printf(format: cstr, *args: int | float | str)`,
   and calls apply C's argument promotions (`f32` to `double`, small integers
@@ -184,7 +193,9 @@ print(program)                            # the MLIR; program.llvm_ir() for LLVM
   defined twice is a link error. `Program` is a `Module` that can also have
   `@program.main` and `build_executable`.
 - `module.mlir` is one module's MLIR (imports appear as declarations) and
-  `module.linked()` the linked whole, for dropping down a level.
+  `module.linked()` the linked whole, for dropping down a level. Loops come
+  out as structured control flow (`scf.for` for counted loops, `scf.while`
+  and `scf.if` otherwise), ready for further passes.
 
 ## Building IR directly
 
@@ -243,9 +254,13 @@ shows the same text.
   invalid arguments raise `ValueError`, `TypeError`, or `OverflowError` instead
   of aborting the process.
 
-Linked dialects: arith, cf, func, llvm, math, memref, scf, and tensor; MLIR's
-core transform passes (canonicalize, cse, inline, symbol-dce, ...); and the
-conversions to LLVM. Other dialects parse only with
+Linked dialects: arith, async, bufferization, cf, emitc, func, irdl, llvm,
+math, memref, scf, tensor, and vector. A dialect named like a Python keyword
+gets a `_dialect` suffix: `mlir_python.dialects.async_dialect`. Also linked:
+MLIR's core transform passes (canonicalize, cse, inline, symbol-dce, ...), the
+bufferization, async, vector, and EmitC passes, the conversions to LLVM and
+to EmitC, and mlir-python's own passes (`scf-uplift-while-to-for`,
+`convert-math-to-emitc-libm`). Other dialects parse only with
 `allow_unregistered_dialects=True`.
 
 ### Compiling
@@ -277,11 +292,138 @@ codegen.build_shared_library(module, "libkernels.so")
   `memoryview`), which the function reads and writes in place. Element type,
   rank, static sizes, and static strides are checked; strided views work where
   the memref type's strides are dynamic.
+- Memref results come back as a `memoryview` copy, shaped like the memref.
+  When the function allocated the buffer for its caller (after
+  `pipelines.buffer_deallocation`, below), `compiled.function(fn,
+  owned_results=True)` frees it once copied.
+- `libraries=[...]` (names like `"m"`, or `Path`s to `.so` and `.a` files)
+  loads external code for the JIT and links it into built binaries.
 - Each stage is available separately: `llvm_lowering_pipeline()` (typed passes
   to inspect or extend), `lower_to_llvm`, `translate_to_llvm_ir` (an
   `LLVMModule` to `verify`, `optimize`, `write_object`, or print as IR or
   `assembly`), and `ExecutionEngine`.
 - Code generation targets the build machine (`LLVM_TARGETS_TO_BUILD=Native`).
+
+### Tensors and buffers
+
+`mlir_python.pipelines` has typed versions of MLIR's named pipelines.
+`bufferize()` turns value-semantic tensors into memrefs (one-shot
+bufferization, across function boundaries), and `buffer_deallocation()` frees
+every heap buffer once nothing uses it, tracking ownership through branches,
+loops, and calls:
+
+```python
+from mlir_python import pipelines
+
+ir.PassManager(ir.Module, pipelines.bufferize()).run(module)  # includes deallocation
+compiled = codegen.compile(module)
+scaled = compiled.function(scale, owned_results=True)(numpy_array)  # a memoryview
+```
+
+### Vectors
+
+The vector dialect's SIMD operations lower to LLVM vector instructions for
+the host. Multi-dimensional transfers are unrolled into loops, and
+`vector.multi_reduction` is reduced to one-dimensional reductions, so vector
+code runs in the JIT and in built binaries like any other code:
+
+```mlir
+%v = vector.transfer_read %buffer[%i], %pad : memref<?xf32>, vector<8xf32>  // masked past the end
+%s = vector.reduction <add>, %v : vector<8xf32> into f32
+```
+
+`mlir_python.dialects.vector` builds the same operations (`vector.LoadOp`,
+`vector.ReductionOp(f32, vector.CombiningKind.ADD, v)`, ...), and the vector
+passes (`passes.LowerVectorMask`, `passes.LowerVectorMultiReduction`, ...)
+are available for custom pipelines.
+
+### Async
+
+`async.execute` starts a task, and `async.await` waits for its value. Tasks
+lower to LLVM coroutines that call an async runtime. mlir-python bundles MLIR's
+reference runtime, a thread pool (`codegen.async_runtime()`), and loads it
+automatically for JIT code. It also links the runtime into binaries that use
+async:
+
+```python
+from mlir_python.dialects import async_dialect
+
+task = async_dialect.execute(results=[i64])        # body block ready to fill
+with ir.InsertionPoint(task.body):
+    async_dialect.YieldOp([arith.MulIOp(x, x).result])
+value = async_dialect.await_value(task.body_results[0])
+```
+
+`async_runtime=Path("libmyruntime.so")` on `compile`, `build_executable`,
+or `build_shared_library` swaps in another implementation of the same C API
+(`mlirAsyncRuntimeExecute`, ...), for example one driven by an event loop.
+The JIT's runtime is process-wide: after the first `compile` that uses
+async, a different runtime is refused with a `ValueError`.
+
+### C and C++ source
+
+`codegen.to_c(module)` and `codegen.to_cpp(module)` translate a copy of a
+module into readable source, via the EmitC dialect, for toolchains MLIR
+does not target. Functions keep their names. `memref<4xf32>` becomes
+`float v[4]`, and math operations call `<math.h>` (or `<cmath>`):
+
+```python
+source = codegen.to_c(module)      # compile with any C99 compiler
+```
+
+Memrefs must have static shapes. The stages are also available separately:
+`emitc_lowering_pipeline`, `lower_to_emitc`, and `translate_to_cpp`.
+`mlir_python.dialects.emitc` and its types (`OpaqueType`, `PointerType`,
+`ArrayType`, ...) build EmitC directly.
+
+### Dialects defined in Python
+
+`mlir_python.irdl` declares new dialects at runtime, through IRDL, with no C++
+or rebuild. Their operations are created, verified against the declared
+constraints, inspected, and rewritten like built-in ones:
+
+```python
+from mlir_python import irdl
+
+bifrost = irdl.Dialect("bifrost")
+Mutex = bifrost.type("mutex")                          # !bifrost.mutex
+
+@bifrost.operation
+class Guard(irdl.Op):
+    """Locks ``mutex``; ``value`` is readable while it is held."""
+
+    mutex = irdl.Operand(irdl.BaseOf(Mutex))
+    value = irdl.Result(irdl.Any())
+
+guard = Guard.create(mutex, value=ir.IntegerType(32))
+guard.value, Guard.all(module)                         # typed accessors; every guard
+```
+
+`dialects.irdl.load_dialects(module)` loads dialects written directly in the
+IRDL dialect.
+
+### Passes written in Python
+
+Subclass `passes.PythonPass` and implement `run`. The result goes anywhere in a
+pipeline, between MLIR's own passes, and dataclass fields become its
+options:
+
+```python
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class LowerGuards(passes.PythonPass):
+    """Rewrites bifrost.guard into runtime calls."""
+
+    def run(self, op: ir.Operation) -> None:
+        for guard in Guard.all(op):
+            ...                                         # build replacements, then
+            guard.replace_with([replacement])
+
+ir.PassManager(ir.Module, [LowerGuards(), passes.Canonicalizer()]).run(module)
+```
+
+`ANCHOR = func.FuncOp` runs the pass on each function (inside `Nested`). An
+exception raised in `run` fails the pipeline and is re-raised from
+`PassManager.run`.
 
 ### Ownership
 

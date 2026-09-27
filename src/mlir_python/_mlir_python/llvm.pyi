@@ -932,7 +932,7 @@ class AllocaOp(mlir_python._mlir_python.Operation):
         Create ``llvm.alloca``.
 
         Args:
-            res_type: Type of result ``res``.
+            res_type: Type of result ``res`` (LLVM pointer type).
             array_size: Operand ``arraySize`` (signless integer).
             elem_type: Attribute ``elem_type`` (any type attribute).
             alignment: Attribute ``alignment`` (64-bit signless integer attribute). Optional.
@@ -947,7 +947,7 @@ class AllocaOp(mlir_python._mlir_python.Operation):
 
     @property
     def res(self) -> mlir_python._mlir_python.OpResult:
-        """Result ``res``."""
+        """Result ``res``: LLVM pointer type."""
 
     @property
     def alignment(self) -> int | None:

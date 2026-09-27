@@ -4,6 +4,7 @@ import ctypes
 import platform
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -90,7 +91,11 @@ def test_lowering_pipeline_is_typed_and_extensible() -> None:
     pipeline = codegen.llvm_lowering_pipeline()
     assert all(isinstance(p, (ir.Nested, codegen.passes.Pass)) for p in pipeline)
     assert str(ir.PassManager(ir.Module, pipeline)) == (
-        "builtin.module(convert-scf-to-cf,convert-to-llvm,reconcile-unrealized-casts)"
+        "builtin.module(func.func(lower-vector-multi-reduction),"
+        "convert-vector-to-scf,async-to-async-runtime,async-runtime-ref-counting,"
+        "async-runtime-ref-counting-opt,convert-async-to-llvm,"
+        "convert-bufferization-to-memref,convert-scf-to-cf,"
+        "convert-vector-to-llvm,convert-to-llvm,reconcile-unrealized-casts)"
     )
 
 
@@ -262,24 +267,53 @@ def test_jit_checks_arguments() -> None:
 
 
 def test_jit_rejects_types_that_cannot_cross_the_boundary() -> None:
+    from mlir_python.dialects import memref
+
     f16 = ir.F16Type()
+    half_buffer = ir.MemRefType([4], f16)
     module = ir.Module()
     with ir.InsertionPoint(module.body):
         takes_half = func.FuncOp("takes_half", ir.FunctionType([f16], []))
-        gives_buffer = func.FuncOp(
-            "gives_buffer", ir.FunctionType([], [ir.MemRefType([4], ir.F32Type())])
-        )
+        gives_halves = func.FuncOp("gives_halves", ir.FunctionType([], [half_buffer]))
     with ir.InsertionPoint(takes_half.add_entry_block()):
         func.ReturnOp()
-    with ir.InsertionPoint(gives_buffer.add_entry_block()):
-        from mlir_python.dialects import memref
-
-        func.ReturnOp([memref.AllocOp(ir.MemRefType([4], ir.F32Type())).memref])
+    with ir.InsertionPoint(gives_halves.add_entry_block()):
+        func.ReturnOp([memref.AllocOp(half_buffer).memref])
     compiled = codegen.compile(module)
     with pytest.raises(TypeError, match="argument 0 has type f16"):
         compiled.function(takes_half)(1.0)
-    with pytest.raises(TypeError, match="result 0 has type memref<4xf32>"):
-        compiled.function(gives_buffer)()
+    with pytest.raises(TypeError, match="result 0 has type memref<4xf16>"):
+        compiled.function(gives_halves)()
+
+
+def test_memref_results_come_back_as_buffers() -> None:
+    """A memref result is copied into a memoryview shaped like it; an owned
+    result (allocated for the caller) is freed once copied."""
+    from mlir_python.dialects import memref
+
+    i64 = ir.IntegerType(64)
+    matrix = ir.MemRefType([2, 3], i64)
+    module = ir.Module()
+    with ir.InsertionPoint(module.body):
+        make = func.FuncOp("make", ir.FunctionType([i64], [matrix]))
+    with ir.InsertionPoint(make.add_entry_block()):
+        buffer = memref.AllocOp(matrix).memref
+        index = ir.IndexType()
+        for row in range(2):
+            for col in range(3):
+                at = [
+                    arith.ConstantOp(ir.IntegerAttr(row, index)).result,
+                    arith.ConstantOp(ir.IntegerAttr(col, index)).result,
+                ]
+                value = arith.ConstantOp(ir.IntegerAttr(10 * row + col, i64)).result
+                total = arith.AddIOp(value, make.arguments[0]).result
+                memref.StoreOp(total, buffer, at)
+        func.ReturnOp([buffer])
+    compiled = codegen.compile(module)
+    result = compiled.function(make, owned_results=True)(100)
+    assert isinstance(result, memoryview)
+    assert (result.format, result.shape) == ("q", (2, 3))
+    assert result.tolist() == [[100, 101, 102], [110, 111, 112]]
 
 
 def test_function_must_belong_to_the_compiled_module() -> None:
@@ -545,3 +579,21 @@ def test_link_errors_carry_the_linker_output(tmp_path: Path) -> None:
         func.ReturnOp(func.CallOp("missing", [], [i32]).results)
     with pytest.raises(codegen.LinkError, match="missing"):
         codegen.build_executable(broken, tmp_path / "broken")
+
+
+def test_every_loadable_dialect_lowers_to_llvm() -> None:
+    """convert-to-llvm aborts the process (it cannot raise) when a loaded
+    dialect promises an LLVM lowering that was never registered, e.g. one
+    loaded as another dialect's dependency. Checked in a subprocess."""
+    script = (
+        "import mlir_python as ir\n"
+        "from mlir_python import codegen\n"
+        "with ir.Context() as ctx:\n"
+        "    ctx.load_all_available_dialects()\n"
+        "    codegen.lower_to_llvm(ir.Module())\n"
+        "    print(len(ctx.loaded_dialects))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
