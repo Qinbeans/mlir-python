@@ -11,7 +11,17 @@ from pathlib import Path
 
 import pytest
 
-from mlir_python.lang import CompileError, Fn, Module, Program, Token, cstr, i32, i64
+from mlir_python.lang import (
+    CompileError,
+    Fn,
+    Module,
+    Program,
+    Token,
+    array,
+    cstr,
+    i32,
+    i64,
+)
 
 CC = shutil.which("cc")
 needs_cc = pytest.mark.skipif(CC is None, reason="needs a C compiler")
@@ -261,3 +271,69 @@ def test_blocking_works_beside_the_programs_own_puts(tmp_path: Path) -> None:
     app = blocking_program.build_executable(tmp_path / "app")
     result = subprocess.run([app], capture_output=True, text=True, check=False)
     assert (result.returncode, result.stdout) == (27, "waiting\n")
+
+
+arrays_program = Program()
+
+
+@arrays_program.function
+def squares(n: i64) -> i64:
+    xs = array(i64, n)
+    for i in range(n):
+        xs[i] = i * i
+    total = 0
+    for x in xs:
+        total += x
+    return total
+
+
+@arrays_program.function
+async def summed(n: i64) -> i64:
+    ys = [n, n, n]  # an async function's arrays are freed too
+    total = squares(n)
+    for y in ys:
+        total += y
+    return total
+
+
+@arrays_program.main
+def arrays_main() -> i32:
+    return i32(summed(4))  # 0 + 1 + 4 + 9, + 12
+
+
+@needs_cc
+def test_arrays_and_async_in_one_program(tmp_path: Path) -> None:
+    app = arrays_program.build_executable(tmp_path / "app")
+    assert subprocess.run([app], check=False).returncode == 26
+    linked = str(arrays_program.linked())
+    summed_body = linked[linked.index("async.func @summed") :]
+    assert "memref.dealloc" in summed_body.split("\n  }")[0]
+
+
+loop_arrays_program = Program()
+
+
+@loop_arrays_program.function
+async def next_of(x: i64) -> i64:
+    return x + 1
+
+
+@loop_arrays_program.function
+async def loop_work(n: i64) -> i64:
+    total = 0
+    for i in range(n):
+        xs = [i, i + 1, i + 2]  # a new array each turn, alive across the pause
+        y = await next_of(xs[0])
+        total += xs[2] + y
+    return total
+
+
+@loop_arrays_program.main
+def loop_main() -> i32:
+    return i32(loop_work(100) % 256)  # 10200 % 256
+
+
+@needs_cc
+def test_arrays_live_across_pauses_in_loops(tmp_path: Path) -> None:
+    app = loop_arrays_program.build_executable(tmp_path / "app")
+    assert subprocess.run([app], check=False).returncode == 216

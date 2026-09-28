@@ -17,6 +17,7 @@ import builtins
 import ctypes
 import itertools
 import os
+import re
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -299,7 +300,7 @@ class Module:
             with _context():
                 linked = _link(modules)
                 if _allocates(linked):
-                    PassManager(ir.Module, pipelines.buffer_deallocation()).run(linked)
+                    linked = _deallocate_buffers(linked)
                 _lower_atomics(linked)
             self._linked = (key, linked)
         return self._linked[1]
@@ -782,9 +783,7 @@ def _link(modules: list[Module]) -> ir.Module:
 
 
 def _allocates(module: ir.Module) -> bool:
-    """Whether ``module`` allocates arrays, which buffer deallocation frees.
-    (It is skipped otherwise: it rejects operations whose memory effects it
-    cannot see, such as ``async.await``, so arrays and ``async`` do not mix yet.)"""
+    """Whether ``module`` allocates arrays, which buffer deallocation frees."""
     found = False
 
     def visit(op: ir.Operation) -> None:
@@ -794,6 +793,125 @@ def _allocates(module: ir.Module) -> bool:
     for op in module.body.operations:
         op.walk(visit)
     return found
+
+
+_PLACEHOLDER = "__mlir_python_async_"
+"""Prefix of the functions async operations stand in for during buffer deallocation."""
+
+_ASYNC_OP = re.compile(
+    r'^(?P<indent>\s*)(?P<results>(?:%[^=]+= )?)"(?P<name>async\.[a-z_.]+)"'
+    r"\((?P<operands>[^()]*)\)(?P<properties>.*?) : \((?P<inputs>.*?)\) -> (?P<outputs>.*?)(?P<loc> loc\(.*\))$"
+)
+_CALL = re.compile(
+    r'"func\.call"\((?P<operands>[^()]*)\) <\{callee = @'
+    + _PLACEHOLDER
+    + r"(?P<index>\d+)[^}]*\}>"
+)
+_FUNCTION_TYPE = re.compile(
+    r"function_type = (?P<type>\(.*?\) -> (?:\(.*?\)|!async\.value<.*?>|!async\.token|[^,}]+))"
+)
+
+
+def _deallocate_buffers(module: ir.Module) -> ir.Module:
+    """Free every function's arrays; return the module with the frees.
+
+    Buffer deallocation handles ``func.func`` alone, and rejects operations
+    whose memory effects it cannot see, which async operations are. So while
+    it runs, each ``async.func`` is a ``func.func`` returning its value
+    unwrapped (``async.return`` a ``func.return``), and every other async
+    operation a call to a declared placeholder of the same type; afterwards
+    they are put back. (The module is round-tripped through MLIR's generic
+    text form, whose operations are one per line.)
+    """
+    originals: list[
+        tuple[str, str]
+    ] = []  # placeholder index -> (op name, its properties/attributes)
+    converted: dict[str, str] = {}  # async.func name -> its function type
+    declarations: list[str] = []
+    ops = []
+    for op in module.body.operations:
+        text = op.get_asm(generic=True, debug_info=True)
+        lines = text.split("\n")
+        header = lines[0]
+        if header.startswith('"async.func"'):
+            found = _FUNCTION_TYPE.search(header)
+            name = re.search(r'sym_name = "([^"]+)"', header)
+            assert found is not None and name is not None
+            original = found.group("type")
+            inputs, _, result = original.partition(" -> ")
+            value = re.fullmatch(r"!async\.value<(.*)>", result)
+            unwrapped = f"{inputs} -> {value.group(1) if value else '()'}"
+            converted[name.group(1)] = original
+            header = header.replace(original, unwrapped, 1).replace(
+                '"async.func"', '"func.func"', 1
+            )
+            lines[0] = header
+        for index, line in enumerate(lines):
+            if '"async.return"(' in line:
+                lines[index] = line.replace('"async.return"(', '"func.return"(', 1)
+                continue
+            match = _ASYNC_OP.match(line)
+            if match is None:
+                continue
+            number = len(originals)
+            originals.append((match["name"], match["properties"]))
+            placeholder = f"{_PLACEHOLDER}{number}"
+            lines[index] = (
+                f'{match["indent"]}{match["results"]}"func.call"({match["operands"]}) <{{callee = @{placeholder}}}>'
+                f" : ({match['inputs']}) -> {match['outputs']}{match['loc']}"
+            )
+            declarations.append(
+                f'"func.func"() <{{function_type = ({match["inputs"]}) -> {match["outputs"]}, '
+                f'sym_name = "{placeholder}", sym_visibility = "private"}}> ({{\n}}) : () -> ()'
+            )
+        ops.append("\n".join(lines))
+    if not converted and not originals:
+        PassManager(ir.Module, pipelines.buffer_deallocation()).run(module)
+        return module
+    body = "\n".join([*ops, *declarations])
+    rewritten = ir.Module.parse(
+        f'"builtin.module"() ({{\n{body}\n}}) : () -> ()', context=module.context
+    )
+    # Control flow in async functions is lifted to loops now, as a func.func's was
+    # when compiled (deallocation handles only structured loops).
+    PassManager(ir.Module, [*_STRUCTURING, *pipelines.buffer_deallocation()]).run(
+        rewritten
+    )
+    # Back to branches in async functions: a coroutine cannot pause inside a
+    # structured loop. (Each run makes earlier handles stale, so look again.)
+    for symbol in converted:
+        target = next(
+            op
+            for op in rewritten.body.operations
+            if isinstance(op, func.FuncOp) and op.sym_name == symbol
+        )
+        PassManager(func.FuncOp, [passes.SCFToControlFlow()]).run(target)
+    restored = []
+    for op in rewritten.body.operations:
+        text = op.get_asm(generic=True, debug_info=True)
+        header = text.split("\n", 1)[0]
+        name = re.search(r'sym_name = "([^"]+)"', header)
+        symbol = name.group(1) if name is not None else ""
+        if symbol.startswith(_PLACEHOLDER):
+            continue
+        if symbol in converted and header.startswith('"func.func"'):
+            found = _FUNCTION_TYPE.search(header)
+            assert found is not None
+            new_header = header.replace(found.group("type"), converted[symbol], 1)
+            new_header = new_header.replace('"func.func"', '"async.func"', 1)
+            text = new_header + text[len(header) :]
+            text = text.replace('"func.return"(', '"async.return"(')
+        text = _CALL.sub(
+            lambda m: (
+                f'"{originals[int(m["index"])][0]}"({m["operands"]}){originals[int(m["index"])][1]}'
+            ),
+            text,
+        )
+        restored.append(text)
+    return ir.Module.parse(
+        '"builtin.module"() ({\n' + "\n".join(restored) + "\n}) : () -> ()",
+        context=module.context,
+    )
 
 
 def _lower_atomics(module: ir.Module) -> None:
