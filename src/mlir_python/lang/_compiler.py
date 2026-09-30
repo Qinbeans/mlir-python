@@ -1442,6 +1442,10 @@ class FunctionCompiler:
         if isinstance(operand, Typed):
             if operand.type == kind:
                 return operand
+            if operand.type.kind == "cstr" and kind.kind == "cstr":
+                # One string type passes as another (e.g. a named one, such as a
+                # string its holder owns): the same pointer to text.
+                return Typed(operand.value, kind)
             if operand.type.kind in ("ptr", "cstr", "fn") and kind == ptr:
                 return Typed(operand.value, kind)  # any pointer passes as a ptr
             if fits_function_type(operand.type, kind):
@@ -2300,6 +2304,8 @@ class FunctionCompiler:
             return Typed(resize(target_type, value).result, kind)
         if source.kind in ("ptr", "cstr", "fn") and kind.kind in ("ptr", "fn"):
             return Typed(value, kind)  # pointers are untyped in memory
+        if source.kind in ("cstr", "ptr") and kind.kind == "cstr":
+            return Typed(value, kind)  # one string type as another; cstr(p) reads memory as text
         if source.kind == "array" and kind.kind == "ptr":
             if kind.element not in (None, source.element):
                 raise self.source.error(

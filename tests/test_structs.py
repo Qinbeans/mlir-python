@@ -17,17 +17,20 @@ from mlir_python.lang import (
     Module,
     Program,
     Ptr,
+    cstr,
     f32,
     f64,
     i8,
     i32,
     i64,
+    ptr,
     stack,
     struct,
     u8,
     u16,
     u32,
 )
+from mlir_python.lang._types import ScalarType
 
 CC = shutil.which("cc")
 needs_cc = pytest.mark.skipif(CC is None, reason="needs a C compiler")
@@ -396,3 +399,35 @@ def test_python_cannot_pass_structs_yet() -> None:
 
     with pytest.raises(TypeError, match="cannot cross from Python"):
         length(Vector2(1.0, 2.0))
+
+
+def test_a_named_string_type_passes_as_a_string() -> None:
+    # A compiler built on this names its own string types (one its holder
+    # owns, say); they are the same pointer to text as cstr, both ways.
+    owned = ScalarType("Owned", "cstr", 64)
+
+    @struct
+    class Named:
+        text: owned
+        count: i32
+
+    m = Module("named_strings")
+
+    @m.extern(name="strlen")
+    def c_strlen(text: cstr) -> i64: ...
+
+    @m.extern(name="strdup")
+    def c_strdup(text: cstr) -> ptr: ...
+
+    @m.extern(name="free")
+    def c_free(pointer: ptr) -> None: ...
+
+    @m.function
+    def run() -> i64:
+        named = Named(text="hello", count=2)
+        copied = cstr(c_strdup(named.text))  # memory read as text, as C's (char *)p
+        length = c_strlen(copied) * i64(named.count)
+        c_free(copied)
+        return length
+
+    assert run() == 10
