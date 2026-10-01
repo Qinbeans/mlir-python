@@ -1,4 +1,4 @@
-"""Pointer arithmetic (``p + n``, ``p - n``) and ``atomic_add``.
+"""Pointer arithmetic (``p + n``, ``p - n``), the null pointer (``ptr(0)``), comparing pointers, and ``atomic_add``.
 
 ``atomic_add`` is checked across real threads: four ``pthread`` workers add to
 one counter, and no increment is lost.
@@ -66,6 +66,20 @@ def count_up() -> tuple[i64, i64]:
 
 
 @program.function
+def nulls() -> i64:
+    counter = stack(i64)
+    nothing = ptr(0)
+    found = 0
+    if nothing == ptr(0):
+        found = found + 1
+    if ptr(counter) != nothing:
+        found = found + 10
+    if counter == counter + 0:
+        found = found + 100
+    return found
+
+
+@program.function
 def worker(argument: ptr) -> ptr:
     counter = Ptr[i64](argument)
     for _ in range(INCREMENTS):
@@ -88,6 +102,10 @@ def count_in_threads() -> i64:
 def test_pointer_arithmetic() -> None:
     assert walk() == 90
     assert byte_steps() == 8
+
+
+def test_null_pointer_and_comparing_pointers() -> None:
+    assert nulls() == 111
 
 
 def test_atomic_add_returns_the_old_value() -> None:
@@ -129,6 +147,11 @@ def compile_error(source: str, tmp_path: Path) -> CompileError:
             "p = stack(f64)\n    return i64(atomic_add(p, 1.0))",
             "atomic_add() takes a pointer to an integer",
         ),
+        (
+            "p = stack(i64)\n    if p < p + 1:\n        return 1\n    return 0",
+            "pointers compare with == and != only",
+        ),
+        ("p = ptr(1)\n    return 0", "ptr values only exist in compiled code"),
     ],
 )
 def test_errors(body: str, message: str, tmp_path: Path) -> None:

@@ -1742,6 +1742,22 @@ class FunctionCompiler:
             raise self.source.error(
                 node, "only ==, !=, <, <=, >, >= comparisons are supported"
             )
+        pointers = ("ptr", "cstr", "fn")
+        if (
+            isinstance(left, Typed)
+            and isinstance(right, Typed)
+            and left.type.kind in pointers
+            and right.type.kind in pointers
+        ):
+            # Two addresses, of any pointer types: the same place, or not.
+            if not isinstance(op, (ast.Eq, ast.NotEq)):
+                raise self.source.error(node, "pointers compare with == and != only")
+            predicate = (
+                llvm.ICmpPredicate.EQ
+                if isinstance(op, ast.Eq)
+                else llvm.ICmpPredicate.NE
+            )
+            return llvm.ICmpOp(predicate, left.value, right.value).result
         a, b = self.unify(left, right, node)
         kind = a.type
         if kind.kind == "float":
@@ -2271,6 +2287,13 @@ class FunctionCompiler:
         if isinstance(operand, Literal):
             if isinstance(operand.value, str):
                 return self.materialize(operand, kind, node)
+            if (
+                kind.kind in ("ptr", "fn")
+                and type(operand.value) is int
+                and operand.value == 0
+            ):
+                # ptr(0): the null pointer, as C's NULL
+                return Typed(llvm.ZeroOp(llvm.PointerType()).result, kind)
             try:
                 converted = kind(operand.value)
             except (OverflowError, TypeError, ValueError) as error:
@@ -2305,7 +2328,9 @@ class FunctionCompiler:
         if source.kind in ("ptr", "cstr", "fn") and kind.kind in ("ptr", "fn"):
             return Typed(value, kind)  # pointers are untyped in memory
         if source.kind in ("cstr", "ptr") and kind.kind == "cstr":
-            return Typed(value, kind)  # one string type as another; cstr(p) reads memory as text
+            return Typed(
+                value, kind
+            )  # one string type as another; cstr(p) reads memory as text
         if source.kind == "array" and kind.kind == "ptr":
             if kind.element not in (None, source.element):
                 raise self.source.error(
