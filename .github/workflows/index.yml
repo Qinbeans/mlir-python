@@ -24,6 +24,7 @@ env:
   REPOSITORIES: >-
     Qinbeans/mlir-python
     Qinbeans/tree-sitter-bifrost
+    Qinbeans/bifrost
 
 permissions:
   contents: read
