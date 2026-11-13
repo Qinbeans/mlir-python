@@ -459,6 +459,21 @@ ir.PassManager(ir.Module, [LowerGuards(), passes.Canonicalizer()]).run(module)
 exception raised in `run` fails the pipeline and is re-raised from
 `PassManager.run`.
 
+A `lang` module runs passes of its own on the program it links, whether it is
+run from Python, built (`build_executable`, `build_shared_library`) or read as
+`module.linked()`:
+
+```python
+program = Program("app", passes=[LowerGuards(), passes.Canonicalizer()])
+program.add_passes(ir.Nested(func.FuncOp, [MyCheck()]))   # links again
+```
+
+They see the whole linked program, every imported module's functions
+included, in structured control flow (`scf`), and run before arrays get their
+frees: buffer deallocation rejects operations whose memory effects it cannot
+see (IRDL operations have none), so a pass can use its own operations as long
+as it rewrites them away.
+
 ### Ownership
 
 Every object keeps its `Context` alive, and every IR handle keeps the IR tree it

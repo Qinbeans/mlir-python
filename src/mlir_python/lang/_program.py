@@ -193,7 +193,11 @@ class Module:
     """
 
     def __init__(
-        self, name: str | None = None, *, libraries: Sequence[codegen.Library] = ()
+        self,
+        name: str | None = None,
+        *,
+        libraries: Sequence[codegen.Library] = (),
+        passes: Sequence[PipelineElement] = (),
     ) -> None:
         """Create an empty module.
 
@@ -205,12 +209,16 @@ class Module:
                 files (see ``codegen.Library``). They are loaded for JIT
                 calls and linked into anything built from a module that
                 imports this one.
+            passes: Passes run on the linked program whenever this module is
+                what is linked (see ``linked``): your own rewrites, checks or
+                optimizations (``passes.PythonPass`` subclasses included).
         """
         caller = sys._getframe(1).f_globals.get("__name__", "module")
         self.name = name or caller
         """The module's name (for messages)."""
         self.libraries: tuple[codegen.Library, ...] = tuple(libraries)
         """Libraries defining this module's externs."""
+        self._passes: tuple[PipelineElement, ...] = tuple(passes)
         self._id = next(_MODULE_IDS)
         self._functions: dict[str, Function[..., Any]] = {}
         self._build_state: _Build | None = None
@@ -286,10 +294,27 @@ class Module:
         """This module as MLIR text."""
         return str(self.mlir)
 
+    @property
+    def passes(self) -> tuple[PipelineElement, ...]:
+        """The passes run on the program this module links (see ``linked``)."""
+        return self._passes
+
+    def add_passes(self, *elements: PipelineElement) -> None:
+        """Run ``elements`` too, after the passes already added, when this
+        module is linked; what was linked before is linked again."""
+        self._passes = (*self._passes, *elements)
+        self._version += 1
+
     def linked(self) -> ir.Module:
         """This module and everything it imports, transitively, linked into
         one MLIR module (what runs and gets built), with frees inserted for
         arrays (buffer deallocation sees the whole program).
+
+        The module's ``passes`` run on the linked program first, before
+        arrays get their frees and atomics their lowering: they see every
+        function, in structured control flow (scf), and may still use
+        operations buffer deallocation would reject (IRDL ones, say) as long
+        as they rewrite them away.
 
         Raises:
             codegen.LinkError: If two modules define the same symbol.
@@ -299,6 +324,9 @@ class Module:
         if self._linked is None or self._linked[0] != key:
             with _context():
                 linked = _link(modules)
+                if self._passes:
+                    PassManager(ir.Module, list(self._passes)).run(linked)
+                    linked.verify()
                 if _allocates(linked):
                     linked = _deallocate_buffers(linked)
                 _lower_atomics(linked)
