@@ -38,9 +38,6 @@ concurrency:
 jobs:
   index:
     runs-on: ubuntu-24.04
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@v7
 
@@ -58,5 +55,15 @@ jobs:
       - uses: actions/upload-pages-artifact@v5
         with:
           path: site
+
+  # A separate job: deploying right after uploading in the same job sometimes
+  # fails with "No artifacts named github-pages were found".
+  deploy:
+    needs: index
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
       - id: deploy
         uses: actions/deploy-pages@v5
